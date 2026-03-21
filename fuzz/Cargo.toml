@@ -1,0 +1,35 @@
+[package]
+name = "zsync-rs-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.zsync-rs]
+path = ".."
+
+[[bin]]
+name = "fuzz_control_file"
+path = "fuzz_targets/fuzz_control_file.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_rsum"
+path = "fuzz_targets/fuzz_rsum.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_matcher"
+path = "fuzz_targets/fuzz_matcher.rs"
+test = false
+doc = false
+bench = false
