@@ -20,7 +20,7 @@ struct TargetBlock {
 pub struct BlockMatcher {
     blocksize: usize,
     hash_lengths: HashLengths,
-    rsum_has_a: bool,
+    rsum_a_mask: u16,
     targets: Vec<TargetBlock>,
     rsum_hash: HashMap<u32, Vec<usize>>,
     known_blocks: Vec<bool>,
@@ -56,16 +56,24 @@ impl BlockMatcher {
 
         let known_blocks = vec![false; targets.len()];
 
-        let rsum_has_a = control.hash_lengths.rsum_bytes >= 3;
+        let rsum_a_mask = match control.hash_lengths.rsum_bytes {
+            0..=2 => 0u16,
+            3 => 0x00ff,
+            _ => 0xffff,
+        };
 
         Self {
             blocksize: control.blocksize,
             hash_lengths: control.hash_lengths,
-            rsum_has_a,
+            rsum_a_mask,
             targets,
             rsum_hash,
             known_blocks,
         }
+    }
+
+    fn rsum_match(&self, target: &Rsum, rolling: &Rsum) -> bool {
+        target.a == (rolling.a & self.rsum_a_mask) && target.b == rolling.b
     }
 
     fn hash_rsum_single(rsum: &Rsum) -> u32 {
@@ -101,106 +109,152 @@ impl BlockMatcher {
         Ok(true)
     }
 
-    pub fn submit_source_data(&mut self, data: &[u8], _offset: u64) -> usize {
+    pub fn submit_source_data(&mut self, data: &[u8], _offset: u64) -> Vec<(usize, usize)> {
         let blocksize = self.blocksize;
         let seq_matches = self.hash_lengths.seq_matches as usize;
-        let mut got_blocks = 0;
+        let context = blocksize * seq_matches;
+        let mut matched_blocks = Vec::new();
 
-        if data.len() < blocksize {
-            return 0;
+        if data.len() < context {
+            return matched_blocks;
         }
 
+        let x_limit = data.len() - context;
+        let mut x = 0usize;
+        let mut next_match_id: Option<usize> = None;
+
         let mut r0 = calc_rsum_block(&data[0..blocksize]);
-        let mut r1 = if seq_matches > 1 && data.len() >= blocksize * 2 {
+        let mut r1 = if seq_matches > 1 {
             calc_rsum_block(&data[blocksize..blocksize * 2])
         } else {
             Rsum { a: 0, b: 0 }
         };
 
-        let x_limit = if seq_matches > 1 {
-            data.len().saturating_sub(blocksize * seq_matches)
-        } else {
-            data.len().saturating_sub(blocksize)
-        };
+        while x < x_limit {
+            let mut blocks_matched = 0usize;
 
-        let mut x = 0usize;
-
-        while x <= x_limit {
-            let mut matched = false;
-
-            let hash = if seq_matches > 1 {
-                Self::hash_rsum_pair(&r0, &r1)
-            } else {
-                Self::hash_rsum_single(&r0)
-            };
-
-            if let Some(candidate_ids) = self.rsum_hash.get(&hash) {
-                for &block_id in candidate_ids {
-                    if self.known_blocks[block_id] {
-                        continue;
-                    }
-
-                    let target = &self.targets[block_id];
-                    let rsum_match = if self.rsum_has_a {
-                        target.rsum.a == r0.a && target.rsum.b == r0.b
-                    } else {
-                        target.rsum.b == r0.b
-                    };
-                    if !rsum_match {
-                        continue;
-                    }
-
-                    if seq_matches > 1 && block_id + 1 < self.targets.len() {
-                        let next_target = &self.targets[block_id + 1];
-                        let next_match = if self.rsum_has_a {
-                            next_target.rsum.a == r1.a && next_target.rsum.b == r1.b
-                        } else {
-                            next_target.rsum.b == r1.b
-                        };
-                        if !next_match {
-                            continue;
-                        }
-                    }
-
+            // Sequential chaining: after a pair match, try the next block individually.
+            // This matches the C zsync `next_match` optimization.
+            if let Some(hint_id) = next_match_id.take()
+                && seq_matches > 1
+                && hint_id < self.targets.len()
+                && !self.known_blocks[hint_id]
+            {
+                let target = &self.targets[hint_id];
+                if self.rsum_match(&target.rsum, &r0) {
                     let block_data = &data[x..x + blocksize];
                     let checksum = calc_md4(block_data);
-
-                    if checksum[..self.hash_lengths.checksum_bytes as usize] == target.checksum[..]
+                    if checksum[..self.hash_lengths.checksum_bytes as usize]
+                        == target.checksum[..]
                     {
-                        self.known_blocks[block_id] = true;
-                        got_blocks += 1;
-                        matched = true;
-                        break;
+                        self.known_blocks[hint_id] = true;
+                        matched_blocks.push((hint_id, x));
+                        blocks_matched = 1;
+                        if hint_id + 1 < self.targets.len() {
+                            next_match_id = Some(hint_id + 1);
+                        }
                     }
                 }
             }
 
-            if matched {
-                x += blocksize;
-                if x <= x_limit {
-                    r0 = calc_rsum_block(&data[x..x + blocksize]);
-                    if seq_matches > 1 && x + blocksize * 2 <= data.len() {
+            // Inner loop: advance byte-by-byte, looking up rolling checksum in hash table
+            while blocks_matched == 0 && x < x_limit {
+                let hash = if seq_matches > 1 {
+                    Self::hash_rsum_pair(&r0, &r1)
+                } else {
+                    Self::hash_rsum_single(&r0)
+                };
+
+                if let Some(candidate_ids) = self.rsum_hash.get(&hash) {
+                    for &block_id in candidate_ids {
+                        if self.known_blocks[block_id] {
+                            continue;
+                        }
+
+                        let target = &self.targets[block_id];
+                        if !self.rsum_match(&target.rsum, &r0) {
+                            continue;
+                        }
+
+                        if seq_matches > 1 && block_id + 1 < self.targets.len() {
+                            let next_target = &self.targets[block_id + 1];
+                            if !self.rsum_match(&next_target.rsum, &r1) {
+                                continue;
+                            }
+
+                            let block_data = &data[x..x + blocksize];
+                            let checksum = calc_md4(block_data);
+                            if checksum[..self.hash_lengths.checksum_bytes as usize]
+                                != target.checksum[..]
+                            {
+                                continue;
+                            }
+
+                            let next_block_data = &data[x + blocksize..x + blocksize * 2];
+                            let next_checksum = calc_md4(next_block_data);
+                            if next_checksum[..self.hash_lengths.checksum_bytes as usize]
+                                == next_target.checksum[..]
+                            {
+                                self.known_blocks[block_id] = true;
+                                self.known_blocks[block_id + 1] = true;
+                                matched_blocks.push((block_id, x));
+                                matched_blocks.push((block_id + 1, x + blocksize));
+                                blocks_matched = seq_matches;
+
+                                if block_id + 2 < self.targets.len() {
+                                    next_match_id = Some(block_id + 2);
+                                }
+                                break;
+                            }
+                        } else {
+                            let block_data = &data[x..x + blocksize];
+                            let checksum = calc_md4(block_data);
+                            if checksum[..self.hash_lengths.checksum_bytes as usize]
+                                == target.checksum[..]
+                            {
+                                self.known_blocks[block_id] = true;
+                                matched_blocks.push((block_id, x));
+                                blocks_matched = 1;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if blocks_matched == 0 {
+                    let oc = data[x];
+                    let nc = data[x + blocksize];
+                    Self::update_rsum(&mut r0, oc, nc, blocksize);
+
+                    if seq_matches > 1 {
+                        let nc2 = data[x + blocksize * 2];
+                        Self::update_rsum(&mut r1, nc, nc2, blocksize);
+                    }
+
+                    x += 1;
+                }
+            }
+
+            if blocks_matched > 0 {
+                x += blocksize * blocks_matched;
+
+                if x >= x_limit {
+                    // Can't calculate rsums for remaining data
+                } else {
+                    // Reuse r1 as r0 when advancing by 1 block (sequential match)
+                    if seq_matches > 1 && blocks_matched == 1 {
+                        r0 = r1;
+                    } else {
+                        r0 = calc_rsum_block(&data[x..x + blocksize]);
+                    }
+                    if seq_matches > 1 {
                         r1 = calc_rsum_block(&data[x + blocksize..x + blocksize * 2]);
                     }
                 }
-            } else {
-                if x + blocksize >= data.len() {
-                    break;
-                }
-                let oc = data[x];
-                let nc = data[x + blocksize];
-                Self::update_rsum(&mut r0, oc, nc, blocksize);
-
-                if seq_matches > 1 && x + blocksize * 2 < data.len() {
-                    let nc2 = data[x + blocksize * 2];
-                    Self::update_rsum(&mut r1, nc, nc2, blocksize);
-                }
-
-                x += 1;
             }
         }
 
-        got_blocks
+        matched_blocks
     }
 
     fn update_rsum(rsum: &mut Rsum, old_byte: u8, new_byte: u8, blocksize: usize) {
@@ -303,8 +357,11 @@ mod tests {
         let control = make_control(&data, 4);
         let mut matcher = BlockMatcher::new(&control);
 
-        let got = matcher.submit_source_data(&data, 0);
-        assert_eq!(got, 3);
+        // Pad with context bytes (blocksize * seq_matches) like submit_source_file does
+        let mut padded = data.clone();
+        padded.resize(data.len() + 4, 0);
+        let got = matcher.submit_source_data(&padded, 0);
+        assert_eq!(got.len(), 3);
         assert!(matcher.is_complete());
     }
 

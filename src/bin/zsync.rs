@@ -39,6 +39,13 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
+fn format_pct(done: usize, total: usize) -> String {
+    if total == 0 {
+        return "100.00".to_string();
+    }
+    format!("{:.2}", done as f64 / total as f64 * 100.0)
+}
+
 fn main() {
     let cli = Cli::parse();
 
@@ -64,12 +71,10 @@ fn main() {
         match assembly.submit_source_file(input_path) {
             Ok(blocks) => {
                 let (done, total) = assembly.block_stats();
-                let pct = if total > 0 {
-                    (done as f64 / total as f64 * 100.0) as u32
-                } else {
-                    0
-                };
-                eprintln!("Matched {blocks} blocks from source ({pct}%)");
+                eprintln!(
+                    "Matched {blocks} blocks from source ({}%)",
+                    format_pct(done, total)
+                );
             }
             Err(e) => eprintln!("Warning: failed to read source file: {e}"),
         }
@@ -78,17 +83,12 @@ fn main() {
     let (done_bytes, total_bytes) = assembly.progress();
     let (done_blocks, total_blocks) = assembly.block_stats();
     let need_bytes = total_bytes - done_bytes;
-    let pct_done = if total_blocks > 0 {
-        (done_blocks as f64 / total_blocks as f64 * 100.0) as u32
-    } else {
-        100
-    };
 
     eprintln!(
         "Target: {} ({} blocks) - {}% complete",
         format_bytes(total_bytes),
         total_blocks,
-        pct_done
+        format_pct(done_blocks, total_blocks)
     );
     eprintln!("Need to download: {}", format_bytes(need_bytes));
 
@@ -99,12 +99,7 @@ fn main() {
                 Ok(0) => break,
                 Ok(n) => {
                     let (done, total) = assembly.block_stats();
-                    let pct = if total > 0 {
-                        (done as f64 / total as f64 * 100.0) as u32
-                    } else {
-                        100
-                    };
-                    eprintln!("Downloaded {n} blocks ({pct}%)");
+                    eprintln!("Downloaded {n} blocks ({}%)", format_pct(done, total));
                 }
                 Err(e) => {
                     eprintln!("Download error: {e}");

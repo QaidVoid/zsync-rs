@@ -90,17 +90,27 @@ impl ZsyncAssembly {
         file.read_to_end(&mut buf)?;
 
         let blocksize = self.control.blocksize;
-        let context = blocksize * 2;
-        let mut total_blocks = 0;
+        let context = blocksize * self.control.hash_lengths.seq_matches as usize;
 
         if buf.len() < context {
             return Ok(0);
         }
 
-        let offset = 0u64;
-        total_blocks += self.matcher.submit_source_data(&buf, offset);
+        // Zero-pad to allow scanning the last context bytes of the source
+        let original_len = buf.len();
+        buf.resize(original_len + context, 0);
 
-        Ok(total_blocks)
+        let matched_blocks = self.matcher.submit_source_data(&buf, 0);
+
+        for (block_id, source_offset) in &matched_blocks {
+            let file_handle = self.ensure_file()?;
+            let write_offset = block_id * blocksize;
+            file_handle.seek(SeekFrom::Start(write_offset as u64))?;
+            let block_data = &buf[*source_offset..source_offset + blocksize];
+            file_handle.write_all(block_data)?;
+        }
+
+        Ok(matched_blocks.len())
     }
 
     fn ensure_file(&mut self) -> Result<&mut File, AssemblyError> {
