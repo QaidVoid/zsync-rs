@@ -17,119 +17,27 @@ struct TargetBlock {
     checksum: [u8; 16],
 }
 
-pub struct BlockMatcher {
+/// Read-only scan state shared across threads.
+struct ScanState<'a> {
+    targets: &'a [TargetBlock],
+    hash_table: &'a [u32],
+    hash_next: &'a [u32],
+    bithash: &'a [u8],
     blocksize: usize,
     blockshift: u8,
-    hash_lengths: HashLengths,
+    seq_matches: usize,
+    checksum_bytes: usize,
     rsum_a_mask: u16,
     hash_func_shift: u32,
-    targets: Vec<TargetBlock>,
-    known_blocks: Vec<bool>,
-    // Flat hash table: each bucket holds the head of a chain (block index)
-    hash_table: Vec<u32>,
-    hash_next: Vec<u32>,
     hash_mask: u32,
-    // Bit hash for fast negative lookups
-    bithash: Vec<u8>,
     bithash_mask: u32,
 }
 
-impl BlockMatcher {
-    pub fn new(control: &ControlFile) -> Self {
-        let num_blocks = control.block_checksums.len();
-        let seq_matches = control.hash_lengths.seq_matches as u32;
-        let rsum_bytes = control.hash_lengths.rsum_bytes as u32;
-
-        let rsum_a_mask: u16 = match rsum_bytes {
-            0..=2 => 0,
-            3 => 0x00ff,
-            _ => 0xffff,
-        };
-
-        let targets: Vec<TargetBlock> = control
-            .block_checksums
-            .iter()
-            .map(|bc| TargetBlock {
-                rsum: Rsum {
-                    a: bc.rsum.a & rsum_a_mask,
-                    b: bc.rsum.b,
-                },
-                checksum: bc.checksum,
-            })
-            .collect();
-
-        // Compute hash table sizing (matching C logic)
-        let rsum_bits = rsum_bytes * 8;
-        let avail_bits = if seq_matches > 1 {
-            rsum_bits.min(16) * 2
-        } else {
-            rsum_bits
-        };
-
-        let mut hash_bits = avail_bits;
-        while hash_bits > 5 && (1u32 << (hash_bits - 1)) > num_blocks as u32 {
-            hash_bits -= 1;
-        }
-        let hash_mask = (1u32 << hash_bits) - 1;
-
-        let bithash_bits_total = (hash_bits + BITHASH_BITS).min(avail_bits);
-        let bithash_mask = (1u32 << bithash_bits_total) - 1;
-
-        let hash_func_shift = if seq_matches > 1 && avail_bits < 24 {
-            bithash_bits_total.saturating_sub(avail_bits / 2)
-        } else {
-            bithash_bits_total.saturating_sub(avail_bits - 16)
-        };
-
-        let blockshift = control.blocksize.trailing_zeros() as u8;
-
-        let mut matcher = Self {
-            blocksize: control.blocksize,
-            blockshift,
-            hash_lengths: control.hash_lengths,
-            rsum_a_mask,
-            hash_func_shift,
-            targets,
-            known_blocks: vec![false; num_blocks],
-            hash_table: vec![HASH_EMPTY; (hash_mask + 1) as usize],
-            hash_next: vec![HASH_EMPTY; num_blocks],
-            hash_mask,
-            bithash: vec![0u8; ((bithash_mask + 1) >> 3) as usize + 1],
-            bithash_mask,
-        };
-
-        // Build hash table in reverse order so chains are in forward order
-        for id in (0..num_blocks).rev() {
-            let h = matcher.calc_hash(id);
-            let bucket = (h & hash_mask) as usize;
-            matcher.hash_next[id] = matcher.hash_table[bucket];
-            matcher.hash_table[bucket] = id as u32;
-            let bh = (h & bithash_mask) as usize;
-            matcher.bithash[bh >> 3] |= 1 << (bh & 7);
-        }
-
-        matcher
-    }
-
-    fn calc_hash(&self, block_id: usize) -> u32 {
-        let mut h = self.targets[block_id].rsum.b as u32;
-        if self.hash_lengths.seq_matches > 1 {
-            let next_b = if block_id + 1 < self.targets.len() {
-                self.targets[block_id + 1].rsum.b as u32
-            } else {
-                0
-            };
-            h ^= next_b << self.hash_func_shift;
-        } else {
-            h ^= (self.targets[block_id].rsum.a as u32) << self.hash_func_shift;
-        }
-        h
-    }
-
+impl ScanState<'_> {
     #[inline(always)]
     fn calc_hash_rolling(&self, r0: &Rsum, r1: &Rsum) -> u32 {
         let mut h = r0.b as u32;
-        if self.hash_lengths.seq_matches > 1 {
+        if self.seq_matches > 1 {
             h ^= (r1.b as u32) << self.hash_func_shift;
         } else {
             h ^= ((r0.a & self.rsum_a_mask) as u32) << self.hash_func_shift;
@@ -137,62 +45,19 @@ impl BlockMatcher {
         h
     }
 
-    fn remove_block_from_hash(&mut self, id: usize) {
-        let h = self.calc_hash(id);
-        let bucket = (h & self.hash_mask) as usize;
-
-        let mut prev = HASH_EMPTY;
-        let mut curr = self.hash_table[bucket];
-
-        while curr != HASH_EMPTY {
-            if curr as usize == id {
-                if prev == HASH_EMPTY {
-                    self.hash_table[bucket] = self.hash_next[id];
-                } else {
-                    self.hash_next[prev as usize] = self.hash_next[id];
-                }
-                return;
-            }
-            prev = curr;
-            curr = self.hash_next[curr as usize];
-        }
-    }
-
     #[inline(always)]
     fn rsum_match(&self, target: &Rsum, rolling: &Rsum) -> bool {
         target.a == (rolling.a & self.rsum_a_mask) && target.b == rolling.b
     }
 
-    pub fn submit_blocks(&mut self, data: &[u8], block_start: usize) -> Result<bool, MatchError> {
-        let blocksize = self.blocksize;
-        let num_blocks = data.len() / blocksize;
-
-        for i in 0..num_blocks {
-            let block_data = &data[i * blocksize..(i + 1) * blocksize];
-            let block_id = block_start + i;
-
-            if block_id >= self.targets.len() {
-                break;
-            }
-
-            let checksum = calc_md4(block_data);
-            if checksum[..self.hash_lengths.checksum_bytes as usize]
-                == self.targets[block_id].checksum[..self.hash_lengths.checksum_bytes as usize]
-            {
-                self.known_blocks[block_id] = true;
-            } else {
-                return Ok(false);
-            }
-        }
-
-        Ok(true)
-    }
-
-    pub fn submit_source_data(&mut self, data: &[u8], _offset: u64) -> Vec<(usize, usize)> {
+    /// Scan a chunk of data for matching blocks. Pure read-only, no mutations.
+    /// `base_offset` is the absolute byte offset of `data[0]` within the source file.
+    /// Returns vec of (target_block_id, absolute_source_offset).
+    fn scan_chunk(&self, data: &[u8], base_offset: usize) -> Vec<(usize, usize)> {
         let blocksize = self.blocksize;
         let blockshift = self.blockshift;
-        let seq_matches = self.hash_lengths.seq_matches as usize;
-        let checksum_bytes = self.hash_lengths.checksum_bytes as usize;
+        let seq_matches = self.seq_matches;
+        let checksum_bytes = self.checksum_bytes;
         let context = blocksize * seq_matches;
         let mut matched_blocks = Vec::new();
 
@@ -214,20 +79,15 @@ impl BlockMatcher {
         while x < x_limit {
             let mut blocks_matched = 0usize;
 
-            // Sequential chaining: after a pair match, try the next block individually
             if let Some(hint_id) = next_match_id.take()
                 && seq_matches > 1
                 && hint_id < self.targets.len()
-                && !self.known_blocks[hint_id]
             {
                 let target = &self.targets[hint_id];
                 if self.rsum_match(&target.rsum, &r0) {
-                    let block_data = &data[x..x + blocksize];
-                    let checksum = calc_md4(block_data);
+                    let checksum = calc_md4(&data[x..x + blocksize]);
                     if checksum[..checksum_bytes] == target.checksum[..checksum_bytes] {
-                        self.known_blocks[hint_id] = true;
-                        self.remove_block_from_hash(hint_id);
-                        matched_blocks.push((hint_id, x));
+                        matched_blocks.push((hint_id, base_offset + x));
                         blocks_matched = 1;
                         if hint_id + 1 < self.targets.len() {
                             next_match_id = Some(hint_id + 1);
@@ -236,11 +96,9 @@ impl BlockMatcher {
                 }
             }
 
-            // Inner loop: advance byte-by-byte with bithash + hash table lookup
             while blocks_matched == 0 && x < x_limit {
                 let hash = self.calc_hash_rolling(&r0, &r1);
 
-                // Fast bithash negative check
                 let bh = (hash & self.bithash_mask) as usize;
                 if self.bithash[bh >> 3] & (1 << (bh & 7)) != 0 {
                     let mut block_idx = self.hash_table[(hash & self.hash_mask) as usize];
@@ -269,12 +127,8 @@ impl BlockMatcher {
                             if next_checksum[..checksum_bytes]
                                 == next_target.checksum[..checksum_bytes]
                             {
-                                self.known_blocks[block_id] = true;
-                                self.known_blocks[block_id + 1] = true;
-                                self.remove_block_from_hash(block_id);
-                                self.remove_block_from_hash(block_id + 1);
-                                matched_blocks.push((block_id, x));
-                                matched_blocks.push((block_id + 1, x + blocksize));
+                                matched_blocks.push((block_id, base_offset + x));
+                                matched_blocks.push((block_id + 1, base_offset + x + blocksize));
                                 blocks_matched = seq_matches;
 
                                 if block_id + 2 < self.targets.len() {
@@ -285,9 +139,7 @@ impl BlockMatcher {
                         } else {
                             let checksum = calc_md4(&data[x..x + blocksize]);
                             if checksum[..checksum_bytes] == target.checksum[..checksum_bytes] {
-                                self.known_blocks[block_id] = true;
-                                self.remove_block_from_hash(block_id);
-                                matched_blocks.push((block_id, x));
+                                matched_blocks.push((block_id, base_offset + x));
                                 blocks_matched = 1;
                                 break;
                             }
@@ -332,6 +184,233 @@ impl BlockMatcher {
                         r1 = calc_rsum_block(&data[x + blocksize..x + blocksize * 2]);
                     }
                 }
+            }
+        }
+
+        matched_blocks
+    }
+}
+
+pub struct BlockMatcher {
+    blocksize: usize,
+    blockshift: u8,
+    hash_lengths: HashLengths,
+    rsum_a_mask: u16,
+    hash_func_shift: u32,
+    targets: Vec<TargetBlock>,
+    known_blocks: Vec<bool>,
+    hash_table: Vec<u32>,
+    hash_next: Vec<u32>,
+    hash_mask: u32,
+    bithash: Vec<u8>,
+    bithash_mask: u32,
+}
+
+impl BlockMatcher {
+    pub fn new(control: &ControlFile) -> Self {
+        let num_blocks = control.block_checksums.len();
+        let seq_matches = control.hash_lengths.seq_matches as u32;
+        let rsum_bytes = control.hash_lengths.rsum_bytes as u32;
+
+        let rsum_a_mask: u16 = match rsum_bytes {
+            0..=2 => 0,
+            3 => 0x00ff,
+            _ => 0xffff,
+        };
+
+        let targets: Vec<TargetBlock> = control
+            .block_checksums
+            .iter()
+            .map(|bc| TargetBlock {
+                rsum: Rsum {
+                    a: bc.rsum.a & rsum_a_mask,
+                    b: bc.rsum.b,
+                },
+                checksum: bc.checksum,
+            })
+            .collect();
+
+        let rsum_bits = rsum_bytes * 8;
+        let avail_bits = if seq_matches > 1 {
+            rsum_bits.min(16) * 2
+        } else {
+            rsum_bits
+        };
+
+        let mut hash_bits = avail_bits;
+        while hash_bits > 5 && (1u32 << (hash_bits - 1)) > num_blocks as u32 {
+            hash_bits -= 1;
+        }
+        let hash_mask = (1u32 << hash_bits) - 1;
+
+        let bithash_bits_total = (hash_bits + BITHASH_BITS).min(avail_bits);
+        let bithash_mask = (1u32 << bithash_bits_total) - 1;
+
+        let hash_func_shift = if seq_matches > 1 && avail_bits < 24 {
+            bithash_bits_total.saturating_sub(avail_bits / 2)
+        } else {
+            bithash_bits_total.saturating_sub(avail_bits - 16)
+        };
+
+        let blockshift = control.blocksize.trailing_zeros() as u8;
+
+        let mut matcher = Self {
+            blocksize: control.blocksize,
+            blockshift,
+            hash_lengths: control.hash_lengths,
+            rsum_a_mask,
+            hash_func_shift,
+            targets,
+            known_blocks: vec![false; num_blocks],
+            hash_table: vec![HASH_EMPTY; (hash_mask + 1) as usize],
+            hash_next: vec![HASH_EMPTY; num_blocks],
+            hash_mask,
+            bithash: vec![0u8; ((bithash_mask + 1) >> 3) as usize + 1],
+            bithash_mask,
+        };
+
+        for id in (0..num_blocks).rev() {
+            let h = matcher.calc_hash(id);
+            let bucket = (h & hash_mask) as usize;
+            matcher.hash_next[id] = matcher.hash_table[bucket];
+            matcher.hash_table[bucket] = id as u32;
+            let bh = (h & bithash_mask) as usize;
+            matcher.bithash[bh >> 3] |= 1 << (bh & 7);
+        }
+
+        matcher
+    }
+
+    fn calc_hash(&self, block_id: usize) -> u32 {
+        let mut h = self.targets[block_id].rsum.b as u32;
+        if self.hash_lengths.seq_matches > 1 {
+            let next_b = if block_id + 1 < self.targets.len() {
+                self.targets[block_id + 1].rsum.b as u32
+            } else {
+                0
+            };
+            h ^= next_b << self.hash_func_shift;
+        } else {
+            h ^= (self.targets[block_id].rsum.a as u32) << self.hash_func_shift;
+        }
+        h
+    }
+
+    fn remove_block_from_hash(&mut self, id: usize) {
+        let h = self.calc_hash(id);
+        let bucket = (h & self.hash_mask) as usize;
+
+        let mut prev = HASH_EMPTY;
+        let mut curr = self.hash_table[bucket];
+
+        while curr != HASH_EMPTY {
+            if curr as usize == id {
+                if prev == HASH_EMPTY {
+                    self.hash_table[bucket] = self.hash_next[id];
+                } else {
+                    self.hash_next[prev as usize] = self.hash_next[id];
+                }
+                return;
+            }
+            prev = curr;
+            curr = self.hash_next[curr as usize];
+        }
+    }
+
+    fn scan_state(&self) -> ScanState<'_> {
+        ScanState {
+            targets: &self.targets,
+            hash_table: &self.hash_table,
+            hash_next: &self.hash_next,
+            bithash: &self.bithash,
+            blocksize: self.blocksize,
+            blockshift: self.blockshift,
+            seq_matches: self.hash_lengths.seq_matches as usize,
+            checksum_bytes: self.hash_lengths.checksum_bytes as usize,
+            rsum_a_mask: self.rsum_a_mask,
+            hash_func_shift: self.hash_func_shift,
+            hash_mask: self.hash_mask,
+            bithash_mask: self.bithash_mask,
+        }
+    }
+
+    pub fn submit_blocks(&mut self, data: &[u8], block_start: usize) -> Result<bool, MatchError> {
+        let blocksize = self.blocksize;
+        let checksum_bytes = self.hash_lengths.checksum_bytes as usize;
+        let num_blocks = data.len() / blocksize;
+
+        for i in 0..num_blocks {
+            let block_data = &data[i * blocksize..(i + 1) * blocksize];
+            let block_id = block_start + i;
+
+            if block_id >= self.targets.len() {
+                break;
+            }
+
+            let checksum = calc_md4(block_data);
+            if checksum[..checksum_bytes] == self.targets[block_id].checksum[..checksum_bytes] {
+                self.known_blocks[block_id] = true;
+            } else {
+                return Ok(false);
+            }
+        }
+
+        Ok(true)
+    }
+
+    pub fn submit_source_data(&mut self, data: &[u8], _offset: u64) -> Vec<(usize, usize)> {
+        let context = self.blocksize * self.hash_lengths.seq_matches as usize;
+        if data.len() < context {
+            return Vec::new();
+        }
+
+        let num_threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+
+        let min_per_thread = 16 * 1024 * 1024; // 16 MB per thread minimum
+        let scannable = data.len() - context;
+
+        let candidates = if num_threads > 1 && scannable >= min_per_thread * 2 {
+            let state = self.scan_state();
+            let actual_threads = num_threads.min(scannable / min_per_thread);
+            let chunk_size = scannable / actual_threads;
+
+            std::thread::scope(|s| {
+                let handles: Vec<_> = (0..actual_threads)
+                    .map(|i| {
+                        let start = i * chunk_size;
+                        let end = if i == actual_threads - 1 {
+                            data.len()
+                        } else {
+                            (i + 1) * chunk_size + context
+                        };
+                        let chunk = &data[start..end];
+                        let state = &state;
+                        s.spawn(move || state.scan_chunk(chunk, start))
+                    })
+                    .collect();
+
+                let mut all: Vec<(usize, usize)> = Vec::new();
+                for h in handles {
+                    all.extend(h.join().unwrap());
+                }
+                all
+            })
+        } else {
+            let state = self.scan_state();
+            state.scan_chunk(data, 0)
+        };
+
+        // Deduplicate: first match per block_id wins
+        let mut seen = vec![false; self.targets.len()];
+        let mut matched_blocks = Vec::new();
+        for (block_id, offset) in candidates {
+            if !seen[block_id] {
+                seen[block_id] = true;
+                self.known_blocks[block_id] = true;
+                self.remove_block_from_hash(block_id);
+                matched_blocks.push((block_id, offset));
             }
         }
 
