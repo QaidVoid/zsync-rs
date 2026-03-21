@@ -162,6 +162,16 @@ impl ControlFile {
         let length: u64 = length.ok_or_else(|| ParseError::MissingField("Length".to_string()))?;
 
         let num_blocks = length.div_ceil(blocksize as u64) as usize;
+
+        // Sanity check: avoid massive allocations from malformed input.
+        // Each block needs (rsum_bytes + checksum_bytes) of data following the header.
+        const MAX_BLOCKS: usize = 64 * 1024 * 1024;
+        if num_blocks > MAX_BLOCKS {
+            return Err(ParseError::InvalidLength(format!(
+                "too many blocks: {num_blocks}"
+            )));
+        }
+
         let block_checksums = Self::read_block_checksums(&mut reader, num_blocks, hash_lengths)?;
 
         Ok(Self {
