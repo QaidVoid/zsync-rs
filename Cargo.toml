@@ -3,10 +3,15 @@ name = "zsync-rs"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "zsync"
+path = "src/bin/zsync.rs"
+
 [dependencies]
 thiserror = "2.0.18"
 md4 = "0.11.0-rc.2"
 sha1 = "0.11.0-rc.5"
 ureq = { version = "3.2.1", default-features = false }
+clap = { version = "4.6.0", features = ["derive"] }
 
 [dev-dependencies]
