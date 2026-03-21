@@ -20,6 +20,7 @@ struct TargetBlock {
 pub struct BlockMatcher {
     blocksize: usize,
     hash_lengths: HashLengths,
+    rsum_has_a: bool,
     targets: Vec<TargetBlock>,
     rsum_hash: HashMap<u32, Vec<usize>>,
     known_blocks: Vec<bool>,
@@ -46,9 +47,12 @@ impl BlockMatcher {
 
         let known_blocks = vec![false; targets.len()];
 
+        let rsum_has_a = control.hash_lengths.rsum_bytes >= 3;
+
         Self {
             blocksize: control.blocksize,
             hash_lengths: control.hash_lengths,
+            rsum_has_a,
             targets,
             rsum_hash,
             known_blocks,
@@ -118,7 +122,12 @@ impl BlockMatcher {
                     }
 
                     let target = &self.targets[block_id];
-                    if target.rsum.a != r0.a || target.rsum.b != r0.b {
+                    let rsum_match = if self.rsum_has_a {
+                        target.rsum.a == r0.a && target.rsum.b == r0.b
+                    } else {
+                        target.rsum.b == r0.b
+                    };
+                    if !rsum_match {
                         continue;
                     }
 

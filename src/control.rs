@@ -189,10 +189,19 @@ impl ControlFile {
         for _ in 0..num_blocks {
             reader.read_exact(&mut buf)?;
 
-            let rsum_a = u16::from_be_bytes([buf[0], buf[1]]);
-            let rsum_b = u16::from_be_bytes([buf[2], buf[3]]);
+            let rsum_bytes = hash_lengths.rsum_bytes as usize;
+            let (rsum_a, rsum_b) = match rsum_bytes {
+                1 => (0u16, u16::from(buf[0])),
+                2 => (0u16, u16::from_be_bytes([buf[0], buf[1]])),
+                3 => (u16::from(buf[0]), u16::from_be_bytes([buf[1], buf[2]])),
+                4 => (
+                    u16::from_be_bytes([buf[0], buf[1]]),
+                    u16::from_be_bytes([buf[2], buf[3]]),
+                ),
+                _ => (0, 0),
+            };
 
-            let checksum = buf[hash_lengths.rsum_bytes as usize..entry_size].to_vec();
+            let checksum = buf[rsum_bytes..entry_size].to_vec();
 
             checksums.push(BlockChecksum {
                 rsum: Rsum {
