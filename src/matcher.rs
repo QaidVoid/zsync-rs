@@ -202,6 +202,10 @@ impl BlockMatcher {
     pub fn is_complete(&self) -> bool {
         self.known_blocks.iter().all(|&k| k)
     }
+
+    pub fn total_blocks(&self) -> usize {
+        self.targets.len()
+    }
 }
 
 #[cfg(test)]
