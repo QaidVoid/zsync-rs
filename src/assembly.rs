@@ -1,5 +1,6 @@
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom};
+use std::os::unix::fs::FileExt;
 use std::path::Path;
 
 use crate::checksum::calc_sha1;
@@ -104,13 +105,17 @@ impl ZsyncAssembly {
 
         for (block_id, source_offset) in &matched_blocks {
             let file_handle = self.ensure_file()?;
-            let write_offset = block_id * blocksize;
-            file_handle.seek(SeekFrom::Start(write_offset as u64))?;
+            let offset = (block_id * blocksize) as u64;
             let block_data = &buf[*source_offset..source_offset + blocksize];
-            file_handle.write_all(block_data)?;
+            Self::write_at_offset(file_handle, block_data, offset)?;
         }
 
         Ok(matched_blocks.len())
+    }
+
+    fn write_at_offset(file: &File, data: &[u8], offset: u64) -> Result<(), AssemblyError> {
+        file.write_all_at(data, offset)?;
+        Ok(())
     }
 
     fn ensure_file(&mut self) -> Result<&mut File, AssemblyError> {
@@ -152,11 +157,12 @@ impl ZsyncAssembly {
         );
         let merged_ranges = merge_byte_ranges(&byte_ranges);
         let mut downloaded_blocks = 0;
+        let blocksize = self.control.blocksize;
+        let mut padded_buf = vec![0u8; blocksize];
 
         for (start, end) in merged_ranges {
             let data = self.http.fetch_range(&url, start, end)?;
 
-            let blocksize = self.control.blocksize;
             let block_start = (start / blocksize as u64) as usize;
             let total_blocks = self.matcher.total_blocks();
             let num_blocks = data.len().div_ceil(blocksize);
@@ -175,19 +181,15 @@ impl ZsyncAssembly {
                 let block_end = std::cmp::min(block_offset + blocksize, data.len());
                 let block_data = &data[block_offset..block_end];
 
-                let padded_block: Vec<u8> = if block_data.len() < blocksize {
-                    let mut padded = block_data.to_vec();
-                    padded.resize(blocksize, 0);
-                    padded
-                } else {
-                    block_data.to_vec()
-                };
+                padded_buf[..block_data.len()].copy_from_slice(block_data);
+                if block_data.len() < blocksize {
+                    padded_buf[block_data.len()..].fill(0);
+                }
 
-                if self.matcher.submit_blocks(&padded_block, block_id)? {
+                if self.matcher.submit_blocks(&padded_buf, block_id)? {
                     let file = self.ensure_file()?;
-                    let write_offset = block_id * blocksize;
-                    file.seek(SeekFrom::Start(write_offset as u64))?;
-                    file.write_all(block_data)?;
+                    let offset = (block_id * blocksize) as u64;
+                    Self::write_at_offset(file, block_data, offset)?;
                     downloaded_blocks += 1;
                 }
             }

@@ -20,10 +20,10 @@ pub enum ParseError {
     UnexpectedEof,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct BlockChecksum {
     pub rsum: Rsum,
-    pub checksum: Vec<u8>,
+    pub checksum: [u8; 16],
 }
 
 #[derive(Debug, Clone)]
@@ -201,7 +201,9 @@ impl ControlFile {
                 _ => (0, 0),
             };
 
-            let checksum = buf[rsum_bytes..entry_size].to_vec();
+            let mut checksum = [0u8; 16];
+            checksum[..hash_lengths.checksum_bytes as usize]
+                .copy_from_slice(&buf[rsum_bytes..entry_size]);
 
             checksums.push(BlockChecksum {
                 rsum: Rsum {

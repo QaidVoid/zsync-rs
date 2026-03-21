@@ -11,10 +11,10 @@ pub enum MatchError {
 const HASH_EMPTY: u32 = u32::MAX;
 const BITHASH_BITS: u32 = 3;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 struct TargetBlock {
     rsum: Rsum,
-    checksum: Vec<u8>,
+    checksum: [u8; 16],
 }
 
 pub struct BlockMatcher {
@@ -54,7 +54,7 @@ impl BlockMatcher {
                     a: bc.rsum.a & rsum_a_mask,
                     b: bc.rsum.b,
                 },
-                checksum: bc.checksum.clone(),
+                checksum: bc.checksum,
             })
             .collect();
 
@@ -177,7 +177,7 @@ impl BlockMatcher {
 
             let checksum = calc_md4(block_data);
             if checksum[..self.hash_lengths.checksum_bytes as usize]
-                == self.targets[block_id].checksum[..]
+                == self.targets[block_id].checksum[..self.hash_lengths.checksum_bytes as usize]
             {
                 self.known_blocks[block_id] = true;
             } else {
@@ -224,7 +224,7 @@ impl BlockMatcher {
                 if self.rsum_match(&target.rsum, &r0) {
                     let block_data = &data[x..x + blocksize];
                     let checksum = calc_md4(block_data);
-                    if checksum[..checksum_bytes] == target.checksum[..] {
+                    if checksum[..checksum_bytes] == target.checksum[..checksum_bytes] {
                         self.known_blocks[hint_id] = true;
                         self.remove_block_from_hash(hint_id);
                         matched_blocks.push((hint_id, x));
@@ -261,12 +261,14 @@ impl BlockMatcher {
                             }
 
                             let checksum = calc_md4(&data[x..x + blocksize]);
-                            if checksum[..checksum_bytes] != target.checksum[..] {
+                            if checksum[..checksum_bytes] != target.checksum[..checksum_bytes] {
                                 continue;
                             }
 
                             let next_checksum = calc_md4(&data[x + blocksize..x + blocksize * 2]);
-                            if next_checksum[..checksum_bytes] == next_target.checksum[..] {
+                            if next_checksum[..checksum_bytes]
+                                == next_target.checksum[..checksum_bytes]
+                            {
                                 self.known_blocks[block_id] = true;
                                 self.known_blocks[block_id + 1] = true;
                                 self.remove_block_from_hash(block_id);
@@ -282,7 +284,7 @@ impl BlockMatcher {
                             }
                         } else {
                             let checksum = calc_md4(&data[x..x + blocksize]);
-                            if checksum[..checksum_bytes] == target.checksum[..] {
+                            if checksum[..checksum_bytes] == target.checksum[..checksum_bytes] {
                                 self.known_blocks[block_id] = true;
                                 self.remove_block_from_hash(block_id);
                                 matched_blocks.push((block_id, x));
@@ -391,10 +393,7 @@ mod tests {
             let rsum = calc_rsum_block(&block);
             let checksum = calc_md4(&block);
 
-            block_checksums.push(BlockChecksum {
-                rsum,
-                checksum: checksum.to_vec(),
-            });
+            block_checksums.push(BlockChecksum { rsum, checksum });
         }
 
         ControlFile {
