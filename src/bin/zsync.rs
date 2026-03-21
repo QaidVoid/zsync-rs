@@ -15,9 +15,9 @@ struct Cli {
     #[arg(short, long, value_name = "FILE")]
     output: Option<PathBuf>,
 
-    /// Source file to use for local matching
+    /// Source file(s) to use for local matching (can be specified multiple times)
     #[arg(short = 'i', long, value_name = "FILE")]
-    input: Option<PathBuf>,
+    input: Vec<PathBuf>,
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -67,16 +67,32 @@ fn main() {
         }
     };
 
-    if let Some(ref input_path) = cli.input {
+    for input_path in &cli.input {
         match assembly.submit_source_file(input_path) {
             Ok(blocks) => {
                 let (done, total) = assembly.block_stats();
                 eprintln!(
-                    "Matched {blocks} blocks from source ({}%)",
+                    "Matched {blocks} blocks from {} ({}%)",
+                    input_path.display(),
                     format_pct(done, total)
                 );
             }
-            Err(e) => eprintln!("Warning: failed to read source file: {e}"),
+            Err(e) => eprintln!("Warning: failed to read {}: {e}", input_path.display()),
+        }
+    }
+
+    // Self-referential scan: the temp file may contain duplicate target blocks
+    if !cli.input.is_empty() && !assembly.is_complete() {
+        match assembly.submit_self_referential() {
+            Ok(0) => {}
+            Ok(blocks) => {
+                let (done, total) = assembly.block_stats();
+                eprintln!(
+                    "Matched {blocks} additional blocks from self-reference ({}%)",
+                    format_pct(done, total)
+                );
+            }
+            Err(e) => eprintln!("Warning: self-referential scan failed: {e}"),
         }
     }
 

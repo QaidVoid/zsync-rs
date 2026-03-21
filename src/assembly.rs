@@ -113,6 +113,43 @@ impl ZsyncAssembly {
         Ok(matched_blocks.len())
     }
 
+    /// Scan the partially-assembled output for duplicate target blocks.
+    /// If the target has the same content at positions A and B, and A was matched
+    /// from a seed file, this finds B without downloading it.
+    pub fn submit_self_referential(&mut self) -> Result<usize, AssemblyError> {
+        if self.file.is_none() {
+            return Ok(0);
+        }
+
+        // Flush writes and read the temp file
+        let file = self.file.as_mut().unwrap();
+        file.sync_all()?;
+
+        let mut buf = Vec::new();
+        file.seek(SeekFrom::Start(0))?;
+        file.read_to_end(&mut buf)?;
+
+        let blocksize = self.control.blocksize;
+        let context = blocksize * self.control.hash_lengths.seq_matches as usize;
+
+        if buf.len() < context {
+            return Ok(0);
+        }
+
+        let original_len = buf.len();
+        buf.resize(original_len + context, 0);
+
+        let matched_blocks = self.matcher.submit_source_data(&buf, 0);
+
+        for (block_id, source_offset) in &matched_blocks {
+            let offset = (block_id * blocksize) as u64;
+            let block_data = &buf[*source_offset..source_offset + blocksize];
+            Self::write_at_offset(self.file.as_ref().unwrap(), block_data, offset)?;
+        }
+
+        Ok(matched_blocks.len())
+    }
+
     fn write_at_offset(file: &File, data: &[u8], offset: u64) -> Result<(), AssemblyError> {
         file.write_all_at(data, offset)?;
         Ok(())
