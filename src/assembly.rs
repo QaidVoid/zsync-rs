@@ -78,6 +78,12 @@ impl ZsyncAssembly {
         self.matcher.is_complete()
     }
 
+    pub fn block_stats(&self) -> (usize, usize) {
+        let total = self.matcher.total_blocks();
+        let todo = self.matcher.blocks_todo();
+        (total - todo, total)
+    }
+
     pub fn submit_source_file(&mut self, path: &Path) -> Result<usize, AssemblyError> {
         let mut file = File::open(path)?;
         let mut buf = Vec::new();
