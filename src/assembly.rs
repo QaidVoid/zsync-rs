@@ -26,6 +26,7 @@ pub enum AssemblyError {
 
 pub struct ZsyncAssembly {
     control: ControlFile,
+    base_url: Option<String>,
     matcher: BlockMatcher,
     http: HttpClient,
     output_path: std::path::PathBuf,
@@ -35,12 +36,21 @@ pub struct ZsyncAssembly {
 
 impl ZsyncAssembly {
     pub fn new(control: ControlFile, output_path: &Path) -> Result<Self, AssemblyError> {
+        Self::with_base_url(control, output_path, None)
+    }
+
+    pub fn with_base_url(
+        control: ControlFile,
+        output_path: &Path,
+        base_url: Option<&str>,
+    ) -> Result<Self, AssemblyError> {
         let matcher = BlockMatcher::new(&control);
         let http = HttpClient::new();
         let temp_path = output_path.with_extension("zsync-tmp");
 
         Ok(Self {
             control,
+            base_url: base_url.map(|s| s.to_string()),
             matcher,
             http,
             output_path: output_path.to_path_buf(),
@@ -52,7 +62,8 @@ impl ZsyncAssembly {
     pub fn from_url(control_url: &str, output_path: &Path) -> Result<Self, AssemblyError> {
         let http = HttpClient::new();
         let control = http.fetch_control_file(control_url)?;
-        Self::new(control, output_path)
+        let base_url = extract_base_url(control_url);
+        Self::with_base_url(control, output_path, Some(&base_url))
     }
 
     pub fn progress(&self) -> (u64, u64) {
@@ -100,12 +111,18 @@ impl ZsyncAssembly {
     }
 
     pub fn download_missing_blocks(&mut self) -> Result<usize, AssemblyError> {
-        let url = self
+        let relative_url = self
             .control
             .urls
             .first()
             .ok_or(AssemblyError::NoUrls)?
             .clone();
+
+        let url = self
+            .base_url
+            .as_ref()
+            .map(|base| resolve_url(base, &relative_url))
+            .unwrap_or(relative_url);
 
         let block_ranges = self.matcher.needed_block_ranges();
         if block_ranges.is_empty() {
@@ -188,6 +205,28 @@ fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
+fn extract_base_url(url: &str) -> String {
+    url.rfind('/')
+        .map(|i| url[..=i].to_string())
+        .unwrap_or_default()
+}
+
+fn resolve_url(base: &str, relative: &str) -> String {
+    if relative.contains("://") {
+        return relative.to_string();
+    }
+    if relative.starts_with('/') {
+        let scheme_end = base.find("://").map(|i| i + 3).unwrap_or(0);
+        let host_end = base[scheme_end..]
+            .find('/')
+            .map(|i| scheme_end + i)
+            .unwrap_or(base.len());
+        format!("{}{}", &base[..host_end], relative)
+    } else {
+        format!("{}{}", base, relative)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,5 +234,33 @@ mod tests {
     #[test]
     fn test_hex_encode() {
         assert_eq!(hex_encode(&[0x00, 0xff, 0x10]), "00ff10");
+    }
+
+    #[test]
+    fn test_extract_base_url() {
+        assert_eq!(
+            extract_base_url("https://example.com/path/file.zsync"),
+            "https://example.com/path/"
+        );
+        assert_eq!(
+            extract_base_url("https://example.com/file.zsync"),
+            "https://example.com/"
+        );
+    }
+
+    #[test]
+    fn test_resolve_url() {
+        assert_eq!(
+            resolve_url("https://example.com/path/", "file.bin"),
+            "https://example.com/path/file.bin"
+        );
+        assert_eq!(
+            resolve_url("https://example.com/path/", "/file.bin"),
+            "https://example.com/file.bin"
+        );
+        assert_eq!(
+            resolve_url("https://example.com/path/", "https://other.com/file.bin"),
+            "https://other.com/file.bin"
+        );
     }
 }
