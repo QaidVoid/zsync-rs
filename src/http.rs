@@ -87,6 +87,36 @@ impl HttpClient {
     }
 }
 
+/// Merge byte ranges to minimize HTTP requests.
+/// If merging all ranges into one wastes less than the needed data itself, use a single request.
+/// Otherwise merge ranges with gaps smaller than 1 MB.
+pub fn merge_byte_ranges(ranges: &[(u64, u64)]) -> Vec<(u64, u64)> {
+    if ranges.len() <= 1 {
+        return ranges.to_vec();
+    }
+
+    let total_needed: u64 = ranges.iter().map(|(s, e)| e - s + 1).sum();
+    let total_span = ranges.last().unwrap().1 - ranges.first().unwrap().0 + 1;
+
+    // If a single request wastes less than the needed data, just use one request
+    if total_span <= total_needed * 2 {
+        return vec![(ranges.first().unwrap().0, ranges.last().unwrap().1)];
+    }
+
+    // Otherwise merge ranges with small gaps
+    let mut merged = vec![ranges[0]];
+    for &(start, end) in &ranges[1..] {
+        let last = merged.last_mut().unwrap();
+        let gap = start.saturating_sub(last.1 + 1);
+        if gap < 1024 * 1024 {
+            last.1 = end;
+        } else {
+            merged.push((start, end));
+        }
+    }
+    merged
+}
+
 pub fn byte_ranges_from_block_ranges(
     block_ranges: &[(usize, usize)],
     blocksize: usize,

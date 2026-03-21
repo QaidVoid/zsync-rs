@@ -356,6 +356,10 @@ impl BlockMatcher {
         ranges
     }
 
+    pub fn is_block_known(&self, block_id: usize) -> bool {
+        block_id < self.known_blocks.len() && self.known_blocks[block_id]
+    }
+
     pub fn blocks_todo(&self) -> usize {
         self.known_blocks.iter().filter(|&&k| !k).count()
     }

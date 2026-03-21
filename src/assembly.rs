@@ -4,7 +4,7 @@ use std::path::Path;
 
 use crate::checksum::calc_sha1;
 use crate::control::ControlFile;
-use crate::http::{HttpClient, byte_ranges_from_block_ranges};
+use crate::http::{HttpClient, byte_ranges_from_block_ranges, merge_byte_ranges};
 use crate::matcher::BlockMatcher;
 use crate::matcher::MatchError;
 
@@ -150,9 +150,10 @@ impl ZsyncAssembly {
             self.control.blocksize,
             self.control.length,
         );
+        let merged_ranges = merge_byte_ranges(&byte_ranges);
         let mut downloaded_blocks = 0;
 
-        for (start, end) in byte_ranges {
+        for (start, end) in merged_ranges {
             let data = self.http.fetch_range(&url, start, end)?;
 
             let blocksize = self.control.blocksize;
@@ -164,6 +165,10 @@ impl ZsyncAssembly {
                 let block_id = block_start + i;
                 if block_id >= total_blocks {
                     break;
+                }
+
+                if self.matcher.is_block_known(block_id) {
+                    continue;
                 }
 
                 let block_offset = i * blocksize;
