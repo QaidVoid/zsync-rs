@@ -141,14 +141,28 @@ impl ZsyncAssembly {
 
             let blocksize = self.control.blocksize;
             let block_start = (start / blocksize as u64) as usize;
-            let num_blocks = data.len() / blocksize;
+            let total_blocks = self.matcher.total_blocks();
+            let num_blocks = data.len().div_ceil(blocksize);
 
             for i in 0..num_blocks {
                 let block_id = block_start + i;
-                let block_offset = i * blocksize;
-                let block_data = &data[block_offset..block_offset + blocksize];
+                if block_id >= total_blocks {
+                    break;
+                }
 
-                if self.matcher.submit_blocks(block_data, block_id)? {
+                let block_offset = i * blocksize;
+                let block_end = std::cmp::min(block_offset + blocksize, data.len());
+                let block_data = &data[block_offset..block_end];
+
+                let padded_block: Vec<u8> = if block_data.len() < blocksize {
+                    let mut padded = block_data.to_vec();
+                    padded.resize(blocksize, 0);
+                    padded
+                } else {
+                    block_data.to_vec()
+                };
+
+                if self.matcher.submit_blocks(&padded_block, block_id)? {
                     let file = self.ensure_file()?;
                     let write_offset = block_id * blocksize;
                     file.seek(SeekFrom::Start(write_offset as u64))?;
