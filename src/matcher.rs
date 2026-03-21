@@ -40,9 +40,18 @@ impl BlockMatcher {
             .collect();
 
         let mut rsum_hash: HashMap<u32, Vec<usize>> = HashMap::new();
-        for target in &targets {
-            let hash = Self::hash_rsum(&target.rsum, control.hash_lengths.seq_matches > 1);
-            rsum_hash.entry(hash).or_default().push(target.id);
+        let seq_matches = control.hash_lengths.seq_matches > 1;
+
+        if seq_matches && targets.len() > 1 {
+            for i in 0..targets.len() - 1 {
+                let hash = Self::hash_rsum_pair(&targets[i].rsum, &targets[i + 1].rsum);
+                rsum_hash.entry(hash).or_default().push(i);
+            }
+        } else {
+            for target in &targets {
+                let hash = Self::hash_rsum_single(&target.rsum);
+                rsum_hash.entry(hash).or_default().push(target.id);
+            }
         }
 
         let known_blocks = vec![false; targets.len()];
@@ -59,12 +68,12 @@ impl BlockMatcher {
         }
     }
 
-    fn hash_rsum(rsum: &Rsum, seq_matches: bool) -> u32 {
-        if seq_matches {
-            ((rsum.b as u32) << 16) | (rsum.a as u32)
-        } else {
-            rsum.b as u32
-        }
+    fn hash_rsum_single(rsum: &Rsum) -> u32 {
+        rsum.b as u32
+    }
+
+    fn hash_rsum_pair(r0: &Rsum, r1: &Rsum) -> u32 {
+        ((r0.b as u32) << 16) | (r1.b as u32)
     }
 
     pub fn submit_blocks(&mut self, data: &[u8], block_start: usize) -> Result<bool, MatchError> {
@@ -94,7 +103,7 @@ impl BlockMatcher {
 
     pub fn submit_source_data(&mut self, data: &[u8], _offset: u64) -> usize {
         let blocksize = self.blocksize;
-        let context = blocksize * self.hash_lengths.seq_matches as usize;
+        let seq_matches = self.hash_lengths.seq_matches as usize;
         let mut got_blocks = 0;
 
         if data.len() < blocksize {
@@ -102,18 +111,28 @@ impl BlockMatcher {
         }
 
         let mut r0 = calc_rsum_block(&data[0..blocksize]);
-        let mut r1 = if self.hash_lengths.seq_matches > 1 {
+        let mut r1 = if seq_matches > 1 && data.len() >= blocksize * 2 {
             calc_rsum_block(&data[blocksize..blocksize * 2])
         } else {
             Rsum { a: 0, b: 0 }
         };
 
-        let x_limit = data.len() - context;
+        let x_limit = if seq_matches > 1 {
+            data.len().saturating_sub(blocksize * seq_matches)
+        } else {
+            data.len().saturating_sub(blocksize)
+        };
+
         let mut x = 0usize;
 
         while x <= x_limit {
             let mut matched = false;
-            let hash = Self::hash_rsum(&r0, self.hash_lengths.seq_matches > 1);
+
+            let hash = if seq_matches > 1 {
+                Self::hash_rsum_pair(&r0, &r1)
+            } else {
+                Self::hash_rsum_single(&r0)
+            };
 
             if let Some(candidate_ids) = self.rsum_hash.get(&hash) {
                 for &block_id in candidate_ids {
@@ -129,6 +148,18 @@ impl BlockMatcher {
                     };
                     if !rsum_match {
                         continue;
+                    }
+
+                    if seq_matches > 1 && block_id + 1 < self.targets.len() {
+                        let next_target = &self.targets[block_id + 1];
+                        let next_match = if self.rsum_has_a {
+                            next_target.rsum.a == r1.a && next_target.rsum.b == r1.b
+                        } else {
+                            next_target.rsum.b == r1.b
+                        };
+                        if !next_match {
+                            continue;
+                        }
                     }
 
                     let block_data = &data[x..x + blocksize];
@@ -148,7 +179,7 @@ impl BlockMatcher {
                 x += blocksize;
                 if x <= x_limit {
                     r0 = calc_rsum_block(&data[x..x + blocksize]);
-                    if self.hash_lengths.seq_matches > 1 && x + blocksize * 2 <= data.len() {
+                    if seq_matches > 1 && x + blocksize * 2 <= data.len() {
                         r1 = calc_rsum_block(&data[x + blocksize..x + blocksize * 2]);
                     }
                 }
@@ -160,7 +191,7 @@ impl BlockMatcher {
                 let nc = data[x + blocksize];
                 Self::update_rsum(&mut r0, oc, nc, blocksize);
 
-                if self.hash_lengths.seq_matches > 1 && x + blocksize * 2 < data.len() {
+                if seq_matches > 1 && x + blocksize * 2 < data.len() {
                     let nc2 = data[x + blocksize * 2];
                     Self::update_rsum(&mut r1, nc, nc2, blocksize);
                 }
