@@ -18,6 +18,10 @@ struct Cli {
     /// Source file(s) to use for local matching (can be specified multiple times)
     #[arg(short = 'i', long, value_name = "FILE")]
     input: Vec<PathBuf>,
+
+    /// Gap threshold in KiB for merging HTTP range requests (default: 256)
+    #[arg(long, value_name = "KIB", default_value_t = 256)]
+    range_gap: u64,
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -66,6 +70,8 @@ fn main() {
             std::process::exit(1);
         }
     };
+
+    assembly.set_range_gap_threshold(cli.range_gap * 1024);
 
     for input_path in &cli.input {
         match assembly.submit_source_file(input_path) {

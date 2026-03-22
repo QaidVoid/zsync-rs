@@ -5,7 +5,9 @@ use std::path::Path;
 
 use crate::checksum::calc_sha1;
 use crate::control::ControlFile;
-use crate::http::{HttpClient, byte_ranges_from_block_ranges, merge_byte_ranges};
+use crate::http::{
+    DEFAULT_RANGE_GAP_THRESHOLD, HttpClient, byte_ranges_from_block_ranges, merge_byte_ranges,
+};
 use crate::matcher::BlockMatcher;
 use crate::matcher::MatchError;
 
@@ -33,6 +35,7 @@ pub struct ZsyncAssembly {
     output_path: std::path::PathBuf,
     temp_path: std::path::PathBuf,
     file: Option<File>,
+    range_gap_threshold: u64,
 }
 
 impl ZsyncAssembly {
@@ -57,6 +60,7 @@ impl ZsyncAssembly {
             output_path: output_path.to_path_buf(),
             temp_path,
             file: None,
+            range_gap_threshold: DEFAULT_RANGE_GAP_THRESHOLD,
         })
     }
 
@@ -65,6 +69,10 @@ impl ZsyncAssembly {
         let control = http.fetch_control_file(control_url)?;
         let base_url = extract_base_url(control_url);
         Self::with_base_url(control, output_path, Some(&base_url))
+    }
+
+    pub fn set_range_gap_threshold(&mut self, threshold: u64) {
+        self.range_gap_threshold = threshold;
     }
 
     pub fn progress(&self) -> (u64, u64) {
@@ -192,7 +200,7 @@ impl ZsyncAssembly {
             self.control.blocksize,
             self.control.length,
         );
-        let merged_ranges = merge_byte_ranges(&byte_ranges);
+        let merged_ranges = merge_byte_ranges(&byte_ranges, self.range_gap_threshold);
         let mut downloaded_blocks = 0;
         let blocksize = self.control.blocksize;
         let mut padded_buf = vec![0u8; blocksize];
