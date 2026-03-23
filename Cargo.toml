@@ -2,6 +2,10 @@
 name = "zsync-rs"
 version = "0.1.0"
 edition = "2024"
+description = "Efficient file transfer using rsync algorithm over HTTP"
+license = "MIT"
+keywords = ["zsync", "rsync", "http", "file-transfer", "delta"]
+categories = ["network-programming", "command-line-utilities"]
 
 [[bin]]
 name = "zsync"
