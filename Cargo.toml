@@ -18,4 +18,9 @@ sha1 = "0.11.0-rc.5"
 ureq = { version = "3.2.1" }
 clap = { version = "4.6.0", features = ["derive"] }
 
-[dev-dependencies]
+[profile.release]
+opt-level = "z"
+strip = true
+lto = true
+panic = "abort"
+codegen-units = 1
