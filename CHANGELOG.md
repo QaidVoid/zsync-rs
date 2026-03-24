@@ -1,4 +1,14 @@
 
+## [0.1.1](https://github.com/QaidVoid/zsync-rs/compare/0.1.0...0.1.1) - 2026-03-24
+
+### Added
+
+- Add progress callback support for downloads - ([45ea884](https://github.com/QaidVoid/zsync-rs/commit/45ea884c758382f715353d4323c7dd473fe8d251))
+
+### Other
+
+- Add release profile - ([5de30ce](https://github.com/QaidVoid/zsync-rs/commit/5de30ce78bab9700a7cb10dfb9d3a3f0955714c4))
+
 ## [0.1.0] - 2026-03-23
 
 ### Added
