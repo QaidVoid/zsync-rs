@@ -5,7 +5,7 @@ pub mod http;
 pub mod matcher;
 pub mod rsum;
 
-pub use assembly::ZsyncAssembly;
+pub use assembly::{ProgressCallback, ZsyncAssembly};
 pub use control::ControlFile;
 pub use http::{HttpClient, HttpError};
 pub use matcher::BlockMatcher;

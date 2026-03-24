@@ -27,6 +27,8 @@ pub enum AssemblyError {
     NoUrls,
 }
 
+pub type ProgressCallback = Box<dyn Fn(u64, u64) + Send + Sync>;
+
 pub struct ZsyncAssembly {
     control: ControlFile,
     base_url: Option<String>,
@@ -36,6 +38,7 @@ pub struct ZsyncAssembly {
     temp_path: std::path::PathBuf,
     file: Option<File>,
     range_gap_threshold: u64,
+    progress_callback: Option<ProgressCallback>,
 }
 
 impl ZsyncAssembly {
@@ -61,6 +64,7 @@ impl ZsyncAssembly {
             temp_path,
             file: None,
             range_gap_threshold: DEFAULT_RANGE_GAP_THRESHOLD,
+            progress_callback: None,
         })
     }
 
@@ -73,6 +77,20 @@ impl ZsyncAssembly {
 
     pub fn set_range_gap_threshold(&mut self, threshold: u64) {
         self.range_gap_threshold = threshold;
+    }
+
+    pub fn set_progress_callback<F>(&mut self, callback: F)
+    where
+        F: Fn(u64, u64) + Send + Sync + 'static,
+    {
+        self.progress_callback = Some(Box::new(callback));
+    }
+
+    fn report_progress(&self) {
+        if let Some(ref cb) = self.progress_callback {
+            let (done, total) = self.progress();
+            cb(done, total);
+        }
     }
 
     pub fn progress(&self) -> (u64, u64) {
@@ -236,6 +254,7 @@ impl ZsyncAssembly {
                     let offset = (block_id * blocksize) as u64;
                     Self::write_at_offset(file, block_data, offset)?;
                     downloaded_blocks += 1;
+                    self.report_progress();
                 }
             }
         }
