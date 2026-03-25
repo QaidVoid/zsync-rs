@@ -1,4 +1,10 @@
 
+## [0.1.2](https://github.com/QaidVoid/zsync-rs/compare/0.1.1...0.1.2) - 2026-03-25
+
+### Other
+
+- Use streaming to reduce memory usage - ([63585a4](https://github.com/QaidVoid/zsync-rs/commit/63585a44118778f1fea7646312e059189e3c0fb2))
+
 ## [0.1.1](https://github.com/QaidVoid/zsync-rs/compare/0.1.0...0.1.1) - 2026-03-24
 
 ### Added
