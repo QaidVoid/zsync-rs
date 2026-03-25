@@ -14,6 +14,16 @@ pub enum HttpError {
     NoUrls,
 }
 
+pub struct HttpRangeReader {
+    reader: Box<dyn std::io::Read + Send + Sync>,
+}
+
+impl std::io::Read for HttpRangeReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.reader.read(buf)
+    }
+}
+
 pub struct HttpClient {
     agent: ureq::Agent,
 }
@@ -45,7 +55,12 @@ impl HttpClient {
         ControlFile::parse(&mut reader).map_err(|e| HttpError::Http(e.to_string()))
     }
 
-    pub fn fetch_range(&self, url: &str, start: u64, end: u64) -> Result<Vec<u8>, HttpError> {
+    pub fn fetch_range_reader(
+        &self,
+        url: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<HttpRangeReader, HttpError> {
         let range_header = format!("bytes={}-{}", start, end);
 
         let response = self
@@ -63,9 +78,15 @@ impl HttpClient {
             )));
         }
 
-        let mut buf = Vec::new();
-        response.into_body().into_reader().read_to_end(&mut buf)?;
+        Ok(HttpRangeReader {
+            reader: Box::new(response.into_body().into_reader()),
+        })
+    }
 
+    pub fn fetch_range(&self, url: &str, start: u64, end: u64) -> Result<Vec<u8>, HttpError> {
+        let mut reader = self.fetch_range_reader(url, start, end)?;
+        let mut buf = Vec::new();
+        reader.read_to_end(&mut buf)?;
         Ok(buf)
     }
 

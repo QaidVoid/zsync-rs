@@ -1,5 +1,9 @@
+use std::io::Read;
+
 use md4::{Digest, Md4};
 use sha1::Sha1;
+
+const SHA1_BUFFER_SIZE: usize = 64 * 1024;
 
 pub fn calc_md4(data: &[u8]) -> [u8; 16] {
     let mut hasher = Md4::new();
@@ -17,6 +21,22 @@ pub fn calc_sha1(data: &[u8]) -> [u8; 20] {
     let mut checksum = [0u8; 20];
     checksum.copy_from_slice(&result);
     checksum
+}
+
+pub fn calc_sha1_stream<R: Read>(reader: &mut R) -> std::io::Result<[u8; 20]> {
+    let mut hasher = Sha1::new();
+    let mut buf = [0u8; SHA1_BUFFER_SIZE];
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    let result = hasher.finalize();
+    let mut checksum = [0u8; 20];
+    checksum.copy_from_slice(&result);
+    Ok(checksum)
 }
 
 #[cfg(test)]

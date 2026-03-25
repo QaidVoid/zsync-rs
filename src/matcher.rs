@@ -358,7 +358,7 @@ impl BlockMatcher {
         Ok(true)
     }
 
-    pub fn submit_source_data(&mut self, data: &[u8], _offset: u64) -> Vec<(usize, usize)> {
+    pub fn submit_source_data(&mut self, data: &[u8], offset: u64) -> Vec<(usize, usize)> {
         let context = self.blocksize * self.hash_lengths.seq_matches as usize;
         if data.len() < context {
             return Vec::new();
@@ -387,7 +387,8 @@ impl BlockMatcher {
                         };
                         let chunk = &data[start..end];
                         let state = &state;
-                        s.spawn(move || state.scan_chunk(chunk, start))
+                        let base = offset as usize + start;
+                        s.spawn(move || state.scan_chunk(chunk, base))
                     })
                     .collect();
 
@@ -399,7 +400,7 @@ impl BlockMatcher {
             })
         } else {
             let state = self.scan_state();
-            state.scan_chunk(data, 0)
+            state.scan_chunk(data, offset as usize)
         };
 
         // Deduplicate: first match per block_id wins

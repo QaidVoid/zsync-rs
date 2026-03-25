@@ -3,13 +3,15 @@ use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 
-use crate::checksum::calc_sha1;
+use crate::checksum::calc_sha1_stream;
 use crate::control::ControlFile;
 use crate::http::{
     DEFAULT_RANGE_GAP_THRESHOLD, HttpClient, byte_ranges_from_block_ranges, merge_byte_ranges,
 };
 use crate::matcher::BlockMatcher;
 use crate::matcher::MatchError;
+
+const STREAM_CHUNK_SIZE: usize = 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AssemblyError {
@@ -112,68 +114,176 @@ impl ZsyncAssembly {
     }
 
     pub fn submit_source_file(&mut self, path: &Path) -> Result<usize, AssemblyError> {
-        let mut file = File::open(path)?;
-        let mut buf = Vec::new();
-        file.read_to_end(&mut buf)?;
+        let file = File::open(path)?;
+        let file_size = file.metadata()?.len() as usize;
 
         let blocksize = self.control.blocksize;
         let context = blocksize * self.control.hash_lengths.seq_matches as usize;
 
-        if buf.len() < context {
+        if file_size < context {
             return Ok(0);
         }
 
-        // Zero-pad to allow scanning the last context bytes of the source
-        let original_len = buf.len();
-        buf.resize(original_len + context, 0);
+        let chunk_size = STREAM_CHUNK_SIZE.max(context * 2);
+        let mut total_matched = 0;
+        let mut buf = vec![0u8; chunk_size + 2 * context];
+        let mut file_offset = 0usize;
 
-        let matched_blocks = self.matcher.submit_source_data(&buf, 0);
+        loop {
+            let overlap_start = file_offset.saturating_sub(context);
+            let overlap_len = file_offset - overlap_start;
 
-        for (block_id, source_offset) in &matched_blocks {
-            let file_handle = self.ensure_file()?;
-            let offset = (block_id * blocksize) as u64;
-            let block_data = &buf[*source_offset..source_offset + blocksize];
-            Self::write_at_offset(file_handle, block_data, offset)?;
+            if overlap_len > 0 {
+                file.read_at(&mut buf[..overlap_len], overlap_start as u64)?;
+            }
+
+            let read_start = overlap_len;
+            let read_len = chunk_size;
+
+            let bytes_read = file.read_at(
+                &mut buf[read_start..read_start + read_len],
+                file_offset as u64,
+            )?;
+            if bytes_read == 0 {
+                break;
+            }
+
+            let data_len = read_start + bytes_read;
+            let chunk_context = if file_offset + bytes_read < file_size {
+                let context_start = file_offset + bytes_read;
+                let context_available = file_size.saturating_sub(context_start).min(context);
+                file.read_at(
+                    &mut buf[data_len..data_len + context_available],
+                    context_start as u64,
+                )?;
+                if context_available < context {
+                    buf[data_len + context_available..data_len + context].fill(0);
+                }
+                data_len + context
+            } else {
+                buf[data_len..data_len + context].fill(0);
+                data_len + context
+            };
+
+            let matched_blocks = self
+                .matcher
+                .submit_source_data(&buf[..chunk_context], overlap_start as u64);
+
+            for (block_id, source_offset) in &matched_blocks {
+                let file_handle = self.ensure_file()?;
+                let offset = (block_id * blocksize) as u64;
+                let buf_offset = source_offset.saturating_sub(overlap_start);
+                debug_assert!(
+                    buf_offset + blocksize <= chunk_context,
+                    "buf_offset {} + blocksize {} > chunk_context {} (source_offset={}, overlap_start={})",
+                    buf_offset,
+                    blocksize,
+                    chunk_context,
+                    source_offset,
+                    overlap_start
+                );
+                let block_data = &buf[buf_offset..buf_offset + blocksize];
+                Self::write_at_offset(file_handle, block_data, offset)?;
+            }
+
+            total_matched += matched_blocks.len();
+            file_offset += bytes_read;
+
+            if bytes_read < read_len {
+                break;
+            }
         }
 
-        Ok(matched_blocks.len())
+        Ok(total_matched)
     }
 
-    /// Scan the partially-assembled output for duplicate target blocks.
-    /// If the target has the same content at positions A and B, and A was matched
-    /// from a seed file, this finds B without downloading it.
     pub fn submit_self_referential(&mut self) -> Result<usize, AssemblyError> {
         if self.file.is_none() {
             return Ok(0);
         }
 
-        // Flush writes and read the temp file
         let file = self.file.as_mut().unwrap();
         file.sync_all()?;
 
-        let mut buf = Vec::new();
-        file.seek(SeekFrom::Start(0))?;
-        file.read_to_end(&mut buf)?;
+        let file_size = file.metadata()?.len() as usize;
 
         let blocksize = self.control.blocksize;
         let context = blocksize * self.control.hash_lengths.seq_matches as usize;
 
-        if buf.len() < context {
+        if file_size < context {
             return Ok(0);
         }
 
-        let original_len = buf.len();
-        buf.resize(original_len + context, 0);
+        let chunk_size = STREAM_CHUNK_SIZE.max(context * 2);
+        let mut total_matched = 0;
+        let mut buf = vec![0u8; chunk_size + 2 * context];
+        let mut file_offset = 0usize;
 
-        let matched_blocks = self.matcher.submit_source_data(&buf, 0);
+        loop {
+            let overlap_start = file_offset.saturating_sub(context);
+            let overlap_len = file_offset - overlap_start;
 
-        for (block_id, source_offset) in &matched_blocks {
-            let offset = (block_id * blocksize) as u64;
-            let block_data = &buf[*source_offset..source_offset + blocksize];
-            Self::write_at_offset(self.file.as_ref().unwrap(), block_data, offset)?;
+            if overlap_len > 0 {
+                file.read_at(&mut buf[..overlap_len], overlap_start as u64)?;
+            }
+
+            let read_start = overlap_len;
+            let read_len = chunk_size;
+
+            let bytes_read = file.read_at(
+                &mut buf[read_start..read_start + read_len],
+                file_offset as u64,
+            )?;
+            if bytes_read == 0 {
+                break;
+            }
+
+            let data_len = read_start + bytes_read;
+            let chunk_context = if file_offset + bytes_read < file_size {
+                let context_start = file_offset + bytes_read;
+                let context_available = file_size.saturating_sub(context_start).min(context);
+                file.read_at(
+                    &mut buf[data_len..data_len + context_available],
+                    context_start as u64,
+                )?;
+                if context_available < context {
+                    buf[data_len + context_available..data_len + context].fill(0);
+                }
+                data_len + context
+            } else {
+                buf[data_len..data_len + context].fill(0);
+                data_len + context
+            };
+
+            let matched_blocks = self
+                .matcher
+                .submit_source_data(&buf[..chunk_context], overlap_start as u64);
+
+            for (block_id, source_offset) in &matched_blocks {
+                let offset = (block_id * blocksize) as u64;
+                let buf_offset = source_offset.saturating_sub(overlap_start);
+                debug_assert!(
+                    buf_offset + blocksize <= chunk_context,
+                    "buf_offset {} + blocksize {} > chunk_context {} (source_offset={}, overlap_start={})",
+                    buf_offset,
+                    blocksize,
+                    chunk_context,
+                    source_offset,
+                    overlap_start
+                );
+                let block_data = &buf[buf_offset..buf_offset + blocksize];
+                Self::write_at_offset(file, block_data, offset)?;
+            }
+
+            total_matched += matched_blocks.len();
+            file_offset += bytes_read;
+
+            if bytes_read < read_len {
+                break;
+            }
         }
 
-        Ok(matched_blocks.len())
+        Ok(total_matched)
     }
 
     fn write_at_offset(file: &File, data: &[u8], offset: u64) -> Result<(), AssemblyError> {
@@ -221,38 +331,82 @@ impl ZsyncAssembly {
         let merged_ranges = merge_byte_ranges(&byte_ranges, self.range_gap_threshold);
         let mut downloaded_blocks = 0;
         let blocksize = self.control.blocksize;
+        let total_blocks = self.matcher.total_blocks();
         let mut padded_buf = vec![0u8; blocksize];
 
-        for (start, end) in merged_ranges {
-            let data = self.http.fetch_range(&url, start, end)?;
+        for (range_start, range_end) in merged_ranges {
+            let mut reader = self.http.fetch_range_reader(&url, range_start, range_end)?;
+            let block_start = (range_start / blocksize as u64) as usize;
+            let initial_offset = (range_start % blocksize as u64) as usize;
 
-            let block_start = (start / blocksize as u64) as usize;
-            let total_blocks = self.matcher.total_blocks();
-            let num_blocks = data.len().div_ceil(blocksize);
+            let mut buf = vec![0u8; blocksize + 64 * 1024];
+            buf[..initial_offset].fill(0);
+            let mut buf_len = initial_offset;
+            let mut current_block_id = block_start;
 
-            for i in 0..num_blocks {
-                let block_id = block_start + i;
-                if block_id >= total_blocks {
+            let mut read_buf = [0u8; 64 * 1024];
+            loop {
+                let n = reader.read(&mut read_buf)?;
+                if n == 0 {
                     break;
                 }
 
-                if self.matcher.is_block_known(block_id) {
-                    continue;
+                if buf_len + n > buf.len() {
+                    buf.resize(buf_len + n, 0);
                 }
+                buf[buf_len..buf_len + n].copy_from_slice(&read_buf[..n]);
+                buf_len += n;
 
-                let block_offset = i * blocksize;
-                let block_end = std::cmp::min(block_offset + blocksize, data.len());
-                let block_data = &data[block_offset..block_end];
+                while buf_len >= blocksize {
+                    if current_block_id >= total_blocks {
+                        break;
+                    }
 
-                padded_buf[..block_data.len()].copy_from_slice(block_data);
-                if block_data.len() < blocksize {
-                    padded_buf[block_data.len()..].fill(0);
+                    if !self.matcher.is_block_known(current_block_id) {
+                        let block_data_end = if current_block_id == total_blocks - 1 {
+                            let last_block_size = (self.control.length as usize) % blocksize;
+                            if last_block_size == 0 {
+                                blocksize
+                            } else {
+                                last_block_size
+                            }
+                        } else {
+                            blocksize
+                        };
+
+                        let block_data = &buf[..block_data_end];
+                        padded_buf[..block_data_end].copy_from_slice(block_data);
+                        if block_data_end < blocksize {
+                            padded_buf[block_data_end..].fill(0);
+                        }
+
+                        if self.matcher.submit_blocks(&padded_buf, current_block_id)? {
+                            let file = self.ensure_file()?;
+                            let file_offset = (current_block_id * blocksize) as u64;
+                            Self::write_at_offset(file, block_data, file_offset)?;
+                            downloaded_blocks += 1;
+                            self.report_progress();
+                        }
+                    }
+
+                    current_block_id += 1;
+                    buf.copy_within(blocksize..buf_len, 0);
+                    buf_len -= blocksize;
                 }
+            }
 
-                if self.matcher.submit_blocks(&padded_buf, block_id)? {
+            if buf_len > 0
+                && current_block_id < total_blocks
+                && !self.matcher.is_block_known(current_block_id)
+            {
+                let block_data = &buf[..buf_len];
+                padded_buf[..buf_len].copy_from_slice(block_data);
+                padded_buf[buf_len..].fill(0);
+
+                if self.matcher.submit_blocks(&padded_buf, current_block_id)? {
                     let file = self.ensure_file()?;
-                    let offset = (block_id * blocksize) as u64;
-                    Self::write_at_offset(file, block_data, offset)?;
+                    let file_offset = (current_block_id * blocksize) as u64;
+                    Self::write_at_offset(file, block_data, file_offset)?;
                     downloaded_blocks += 1;
                     self.report_progress();
                 }
@@ -277,10 +431,7 @@ impl ZsyncAssembly {
 
         if let Some(ref expected) = expected_sha1 {
             file.seek(SeekFrom::Start(0))?;
-            let mut buf = Vec::new();
-            file.read_to_end(&mut buf)?;
-
-            let actual_checksum = calc_sha1(&buf);
+            let actual_checksum = calc_sha1_stream(file)?;
             let actual_hex = hex_encode(&actual_checksum);
 
             if !actual_hex.eq_ignore_ascii_case(expected) {
