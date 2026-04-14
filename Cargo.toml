@@ -11,6 +11,10 @@ categories = ["network-programming", "command-line-utilities"]
 name = "zsync"
 path = "src/bin/zsync.rs"
 
+[[bin]]
+name = "zsyncmake"
+path = "src/bin/zsyncmake.rs"
+
 [dependencies]
 thiserror = "2.0.18"
 md4 = "0.11.0-rc.2"
