@@ -1,4 +1,14 @@
 
+## [0.1.3](https://github.com/QaidVoid/zsync-rs/compare/0.1.2...0.1.3) - 2026-04-14
+
+### Added
+
+- Add zsyncmake support - ([85001b0](https://github.com/QaidVoid/zsync-rs/commit/85001b022ef42bbd896e630e1566552bd6c8e94a))
+
+### Other
+
+- Add zsyncmake binary to release - ([f509660](https://github.com/QaidVoid/zsync-rs/commit/f5096605ef537bbad940cb0c32b29c75464a7a5a))
+
 ## [0.1.2](https://github.com/QaidVoid/zsync-rs/compare/0.1.1...0.1.2) - 2026-03-25
 
 ### Other
