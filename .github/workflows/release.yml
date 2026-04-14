@@ -61,12 +61,15 @@ jobs:
           mkdir -p release
           cp {LICENSE,README.md} release/
           cp "target/${{ matrix.build.TARGET }}/release/zsync" release/
+          cp "target/${{ matrix.build.TARGET }}/release/zsyncmake" release/
 
       - name: Create release artifacts
         shell: bash
         run: |
           cp release/zsync zsync-${{ matrix.build.NAME }}
+          cp release/zsyncmake zsyncmake-${{ matrix.build.NAME }}
           b3sum zsync-${{ matrix.build.NAME }} > zsync-${{ matrix.build.NAME }}.b3sum
+          b3sum zsyncmake-${{ matrix.build.NAME }} > zsyncmake-${{ matrix.build.NAME }}.b3sum
           tar -cJvf zsync-${{ matrix.build.NAME }}.tar.xz release/
           b3sum zsync-${{ matrix.build.NAME }}.tar.xz > zsync-${{ matrix.build.NAME }}.tar.xz.b3sum
 
@@ -74,7 +77,7 @@ jobs:
         uses: svenstaro/upload-release-action@v2
         with:
           repo_token: ${{ secrets.GITHUB_TOKEN }}
-          file: zsync-${{ matrix.build.NAME }}*
+          file: '{zsync,zsyncmake}-${{ matrix.build.NAME }}*'
           file_glob: true
           overwrite: true
           tag: ${{ github.ref }}
@@ -83,4 +86,4 @@ jobs:
         uses: actions/attest-build-provenance@v2
         with:
           subject-name: "zsync-${{ matrix.build.NAME }}"
-          subject-path: zsync-${{ matrix.build.NAME }}*
+          subject-path: '{zsync,zsyncmake}-${{ matrix.build.NAME }}*'
