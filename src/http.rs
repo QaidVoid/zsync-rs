@@ -73,6 +73,13 @@ impl HttpClient {
         ControlFile::parse(&mut reader).map_err(|e| HttpError::Http(e.to_string()))
     }
 
+    /// A reader over `start..=end` of `url`.
+    ///
+    /// The reader is capped at the requested length. Without that cap the
+    /// origin decides how much the client reads: a response longer than
+    /// the range is consumed in full, and callers that accumulate it, such
+    /// as block assembly, grow a buffer to match. Bytes past the range
+    /// were never asked for and are of no use, so they are not read.
     pub fn fetch_range_reader(
         &self,
         url: &str,
@@ -80,6 +87,7 @@ impl HttpClient {
         end: u64,
     ) -> Result<HttpRangeReader, HttpError> {
         let range_header = format!("bytes={}-{}", start, end);
+        let requested = end.saturating_sub(start).saturating_add(1);
 
         let response = self
             .agent
@@ -97,7 +105,7 @@ impl HttpClient {
         }
 
         Ok(HttpRangeReader {
-            reader: Box::new(response.into_body().into_reader()),
+            reader: Box::new(response.into_body().into_reader().take(requested)),
         })
     }
 
@@ -168,6 +176,49 @@ pub fn byte_ranges_from_block_ranges(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A server that answers any request with far more data than asked
+    /// for, which is what a hostile or broken origin does.
+    fn overlong_server(body_len: usize) -> String {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                let mut req = [0u8; 1024];
+                let _ = std::io::Read::read(&mut sock, &mut req);
+                let hdr = format!(
+                    "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-1023/{}\r\nContent-Length: {}\r\n\r\n",
+                    body_len, body_len
+                );
+                let _ = sock.write_all(hdr.as_bytes());
+                let chunk = vec![0u8; 64 * 1024];
+                let mut sent = 0;
+                while sent < body_len {
+                    let n = chunk.len().min(body_len - sent);
+                    if sock.write_all(&chunk[..n]).is_err() {
+                        break;
+                    }
+                    sent += n;
+                }
+            }
+        });
+        format!("http://{}/f", addr)
+    }
+
+    #[test]
+    fn a_range_response_is_capped_at_what_was_requested() {
+        // 1 KiB asked for, 8 MiB offered. Accepting the surplus lets any
+        // origin decide how much memory the client spends.
+        let url = overlong_server(8 * 1024 * 1024);
+        let client = HttpClient::new();
+        let data = client.fetch_range(&url, 0, 1023).expect("fetch");
+        assert_eq!(
+            data.len(),
+            1024,
+            "a range response must be capped at the requested length"
+        );
+    }
 
     #[test]
     fn a_supplied_agent_carries_its_own_policy() {
