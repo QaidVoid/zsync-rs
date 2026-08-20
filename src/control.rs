@@ -33,6 +33,8 @@ pub enum ParseError {
     InvalidLength(String),
     #[error("Unexpected end of file")]
     UnexpectedEof,
+    #[error("Header section exceeds {0} bytes")]
+    HeaderTooLarge(u64),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -72,7 +74,18 @@ impl Default for HashLengths {
 }
 
 impl ControlFile {
+    /// Parse a control file.
+    ///
+    /// The header section is read through a byte cap. It arrives from the
+    /// network, and both a single unterminated line and an endless run of
+    /// `URL:` lines would otherwise grow without bound, letting the origin
+    /// choose how much memory the client spends before any of it is
+    /// validated.
     pub fn parse<R: Read>(reader: R) -> Result<Self, ParseError> {
+        /// Generous: real headers are a few hundred bytes, and even a long
+        /// mirror list is far below this.
+        const MAX_HEADER_BYTES: u64 = 1 << 20;
+
         let mut reader = std::io::BufReader::new(reader);
         let mut line = String::new();
 
@@ -85,10 +98,14 @@ impl ControlFile {
         let mut urls = Vec::new();
         let mut sha1 = None;
 
+        let mut header = (&mut reader).take(MAX_HEADER_BYTES);
         loop {
             line.clear();
-            let bytes_read = reader.read_line(&mut line)?;
+            let bytes_read = header.read_line(&mut line)?;
             if bytes_read == 0 {
+                if header.limit() == 0 {
+                    return Err(ParseError::HeaderTooLarge(MAX_HEADER_BYTES));
+                }
                 return Err(ParseError::UnexpectedEof);
             }
 
@@ -401,6 +418,56 @@ fn calculate_hash_lengths(file_length: u64, blocksize: usize) -> HashLengths {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stream that never ends and never contains a newline, which is
+    /// what a hostile origin serves to make the client read forever.
+    struct Endless;
+
+    impl std::io::Read for Endless {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            buf.fill(b'A');
+            Ok(buf.len())
+        }
+    }
+
+    #[test]
+    fn an_endless_header_is_refused_rather_than_buffered() {
+        // The cap is what makes this terminate at all. Which error comes
+        // out depends on where the cut lands: a line with no separator is
+        // reported as a bad header, a truncated section as an oversized
+        // one. Either is fine; reading forever is not.
+        let err = ControlFile::parse(Endless).expect_err("must not read forever");
+        assert!(
+            matches!(
+                err,
+                ParseError::HeaderTooLarge(_) | ParseError::InvalidHeader(_)
+            ),
+            "expected the header cap to stop parsing, got: {err}"
+        );
+    }
+
+    #[test]
+    fn an_endless_run_of_headers_is_refused() {
+        // Individually valid lines, without end. The cap has to bound the
+        // section, not just a single line.
+        struct ManyUrls;
+        impl std::io::Read for ManyUrls {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let line = b"URL: http://example.invalid/f\n";
+                let mut written = 0;
+                while written + line.len() <= buf.len() {
+                    buf[written..written + line.len()].copy_from_slice(line);
+                    written += line.len();
+                }
+                Ok(written.max(1))
+            }
+        }
+        let err = ControlFile::parse(ManyUrls).expect_err("must not read forever");
+        assert!(
+            matches!(err, ParseError::HeaderTooLarge(_)),
+            "expected a header cap error, got: {err}"
+        );
+    }
 
     #[test]
     fn test_parse_minimal() {
