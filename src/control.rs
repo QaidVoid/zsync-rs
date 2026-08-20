@@ -224,7 +224,13 @@ impl ControlFile {
         num_blocks: usize,
         hash_lengths: HashLengths,
     ) -> Result<Vec<BlockChecksum>, ParseError> {
-        let mut checksums = Vec::with_capacity(num_blocks);
+        // Reserve for what has arrived, not for what was claimed. The count
+        // is derived from a header a few bytes long, so sizing the buffer
+        // from it lets a tiny response reserve gigabytes before a single
+        // checksum is read. Growth is geometric, so a genuinely large file
+        // costs a handful of reallocations and nothing else.
+        const MAX_PREALLOC: usize = 1 << 16;
+        let mut checksums = Vec::with_capacity(num_blocks.min(MAX_PREALLOC));
         let entry_size = (hash_lengths.rsum_bytes + hash_lengths.checksum_bytes) as usize;
         let mut buf = vec![0u8; entry_size];
 

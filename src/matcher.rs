@@ -243,6 +243,11 @@ impl BlockMatcher {
         }
         let hash_mask = (1u32 << hash_bits) - 1;
 
+        // Safe only because the parser caps a control file at 2^26 blocks,
+        // which holds hash_bits at 27 and this sum at 30. Raising that cap
+        // past 2^28 makes this reach 32, where the shift below overflows:
+        // a panic in debug, and a mask that collapses every bucket to one
+        // in release.
         let bithash_bits_total = (hash_bits + BITHASH_BITS).min(avail_bits);
         let bithash_mask = (1u32 << bithash_bits_total) - 1;
 
