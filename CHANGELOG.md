@@ -1,4 +1,16 @@
 
+## [0.1.4](https://github.com/QaidVoid/zsync-rs/compare/0.1.3...0.1.4) - 2026-08-20
+
+### Added
+
+- Allow a caller-supplied HTTP agent - ([ff8739b](https://github.com/QaidVoid/zsync-rs/commit/ff8739b081931adde99be730a99717b2ff57ede7))
+
+### Fixed
+
+- Bound control file checksum preallocation - ([e953c08](https://github.com/QaidVoid/zsync-rs/commit/e953c08defaae7d9e21e545f50f0d1d53aed26b5))
+- Bound the control file header section - ([23e5ed6](https://github.com/QaidVoid/zsync-rs/commit/23e5ed65aee67d663294059a6c71df8c2c390f63))
+- Cap a range response at the requested length - ([252fc21](https://github.com/QaidVoid/zsync-rs/commit/252fc21ed8db18e6103df19058d52f817fc54ffb))
+
 ## [0.1.3](https://github.com/QaidVoid/zsync-rs/compare/0.1.2...0.1.3) - 2026-04-14
 
 ### Added
