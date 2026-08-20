@@ -24,6 +24,7 @@ impl std::io::Read for HttpRangeReader {
     }
 }
 
+/// HTTP transport for fetching control files and byte ranges.
 pub struct HttpClient {
     agent: ureq::Agent,
 }
@@ -35,6 +36,13 @@ impl Default for HttpClient {
 }
 
 impl HttpClient {
+    /// A client with ureq's default policy, permitting plain HTTP.
+    ///
+    /// zsync is routinely served over HTTP and across mirror redirects, so
+    /// the defaults are permissive on purpose. An embedder with a stricter
+    /// policy, such as one that must refuse a downgrade to HTTP or pin its
+    /// own trust roots, should build an agent and pass it to
+    /// [`HttpClient::with_agent`] rather than relying on these.
     pub fn new() -> Self {
         Self {
             agent: ureq::Agent::config_builder()
@@ -42,6 +50,16 @@ impl HttpClient {
                 .build()
                 .new_agent(),
         }
+    }
+
+    /// A client using a caller-supplied agent.
+    ///
+    /// The agent carries the whole transport policy: TLS roots, whether a
+    /// redirect may downgrade to HTTP, timeouts and proxies. Supplying one
+    /// keeps that decision with the embedder, which is the only place that
+    /// knows what the transferred bytes are trusted for.
+    pub fn with_agent(agent: ureq::Agent) -> Self {
+        Self { agent }
     }
 
     pub fn fetch_control_file(&self, url: &str) -> Result<ControlFile, HttpError> {
@@ -150,6 +168,27 @@ pub fn byte_ranges_from_block_ranges(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_supplied_agent_carries_its_own_policy() {
+        // The point of `with_agent` is that the embedder's policy reaches
+        // the transfer. A client built with an HTTPS-only agent must refuse
+        // a plain-HTTP URL, where the default client would allow it.
+        let strict = HttpClient::with_agent(
+            ureq::Agent::config_builder()
+                .https_only(true)
+                .build()
+                .new_agent(),
+        );
+        let err = strict
+            .fetch_control_file("http://127.0.0.1:1/nothing.zsync")
+            .expect_err("an HTTPS-only agent must refuse a plain-HTTP URL");
+        let msg = err.to_string();
+        assert!(
+            msg.to_lowercase().contains("http"),
+            "expected a scheme rejection, got: {msg}"
+        );
+    }
 
     #[test]
     fn test_byte_ranges_from_block_ranges() {

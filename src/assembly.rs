@@ -53,8 +53,21 @@ impl ZsyncAssembly {
         output_path: &Path,
         base_url: Option<&str>,
     ) -> Result<Self, AssemblyError> {
+        Self::with_client(control, output_path, base_url, HttpClient::new())
+    }
+
+    /// Assemble using a caller-supplied HTTP client.
+    ///
+    /// The client carries the transport policy for every range request the
+    /// assembly makes, so an embedder that needs its own TLS roots or that
+    /// must refuse a redirect to plain HTTP can set it once here.
+    pub fn with_client(
+        control: ControlFile,
+        output_path: &Path,
+        base_url: Option<&str>,
+        http: HttpClient,
+    ) -> Result<Self, AssemblyError> {
         let matcher = BlockMatcher::new(&control);
-        let http = HttpClient::new();
         let temp_path = output_path.with_extension("zsync-tmp");
 
         Ok(Self {
@@ -71,10 +84,21 @@ impl ZsyncAssembly {
     }
 
     pub fn from_url(control_url: &str, output_path: &Path) -> Result<Self, AssemblyError> {
-        let http = HttpClient::new();
+        Self::from_url_with_client(control_url, output_path, HttpClient::new())
+    }
+
+    /// Fetch the control file and assemble, both using `http`.
+    ///
+    /// The same client serves the control-file fetch and every subsequent
+    /// range request, so one policy covers the whole transfer.
+    pub fn from_url_with_client(
+        control_url: &str,
+        output_path: &Path,
+        http: HttpClient,
+    ) -> Result<Self, AssemblyError> {
         let control = http.fetch_control_file(control_url)?;
         let base_url = extract_base_url(control_url);
-        Self::with_base_url(control, output_path, Some(&base_url))
+        Self::with_client(control, output_path, Some(&base_url), http)
     }
 
     pub fn set_range_gap_threshold(&mut self, threshold: u64) {
