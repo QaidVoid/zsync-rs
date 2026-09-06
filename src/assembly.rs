@@ -2,6 +2,8 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::FileExt;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::checksum::calc_sha1_stream;
 use crate::control::ControlFile;
@@ -27,6 +29,16 @@ pub enum AssemblyError {
     ChecksumMismatch { expected: String, actual: String },
     #[error("No URLs available")]
     NoUrls,
+    #[error("Aborted")]
+    Aborted,
+}
+
+/// Reports whether the caller has raised the abort flag.
+///
+/// Free function rather than a method so the scan and download loops can poll
+/// it while still holding a mutable borrow of the assembly.
+fn aborted(flag: &Option<Arc<AtomicBool>>) -> bool {
+    flag.as_ref().is_some_and(|f| f.load(Ordering::Relaxed))
 }
 
 pub type ProgressCallback = Box<dyn Fn(u64, u64) + Send + Sync>;
@@ -41,6 +53,7 @@ pub struct ZsyncAssembly {
     file: Option<File>,
     range_gap_threshold: u64,
     progress_callback: Option<ProgressCallback>,
+    abort_flag: Option<Arc<AtomicBool>>,
 }
 
 impl ZsyncAssembly {
@@ -80,6 +93,7 @@ impl ZsyncAssembly {
             file: None,
             range_gap_threshold: DEFAULT_RANGE_GAP_THRESHOLD,
             progress_callback: None,
+            abort_flag: None,
         })
     }
 
@@ -103,6 +117,15 @@ impl ZsyncAssembly {
 
     pub fn set_range_gap_threshold(&mut self, threshold: u64) {
         self.range_gap_threshold = threshold;
+    }
+
+    /// Sets a flag polled during the scan and download loops.
+    ///
+    /// Once the caller raises it, the running operation stops at the next
+    /// chunk boundary and returns [`AssemblyError::Aborted`], so a long
+    /// transfer can be cancelled without waiting for it to finish.
+    pub fn set_abort_flag(&mut self, flag: Arc<AtomicBool>) {
+        self.abort_flag = Some(flag);
     }
 
     pub fn set_progress_callback<F>(&mut self, callback: F)
@@ -153,7 +176,13 @@ impl ZsyncAssembly {
         let mut buf = vec![0u8; chunk_size + 2 * context];
         let mut file_offset = 0usize;
 
+        let abort_flag = self.abort_flag.clone();
+
         loop {
+            if aborted(&abort_flag) {
+                return Err(AssemblyError::Aborted);
+            }
+
             let overlap_start = file_offset.saturating_sub(context);
             let overlap_len = file_offset - overlap_start;
 
@@ -243,7 +272,13 @@ impl ZsyncAssembly {
         let mut buf = vec![0u8; chunk_size + 2 * context];
         let mut file_offset = 0usize;
 
+        let abort_flag = self.abort_flag.clone();
+
         loop {
+            if aborted(&abort_flag) {
+                return Err(AssemblyError::Aborted);
+            }
+
             let overlap_start = file_offset.saturating_sub(context);
             let overlap_len = file_offset - overlap_start;
 
@@ -358,7 +393,13 @@ impl ZsyncAssembly {
         let total_blocks = self.matcher.total_blocks();
         let mut padded_buf = vec![0u8; blocksize];
 
+        let abort_flag = self.abort_flag.clone();
+
         for (range_start, range_end) in merged_ranges {
+            if aborted(&abort_flag) {
+                return Err(AssemblyError::Aborted);
+            }
+
             let mut reader = self.http.fetch_range_reader(&url, range_start, range_end)?;
             let block_start = (range_start / blocksize as u64) as usize;
             let initial_offset = (range_start % blocksize as u64) as usize;
@@ -370,6 +411,10 @@ impl ZsyncAssembly {
 
             let mut read_buf = [0u8; 64 * 1024];
             loop {
+                if aborted(&abort_flag) {
+                    return Err(AssemblyError::Aborted);
+                }
+
                 let n = reader.read(&mut read_buf)?;
                 if n == 0 {
                     break;
