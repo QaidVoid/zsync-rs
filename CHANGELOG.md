@@ -1,4 +1,19 @@
 
+## [0.2.0](https://github.com/QaidVoid/zsync-rs/compare/0.1.4...0.2.0) - 2026-09-08
+
+### Added
+
+- *(assembly)* Add an abort flag for scans and downloads - ([cfe1b24](https://github.com/QaidVoid/zsync-rs/commit/cfe1b24a72f54b285413f6a25a74ddefc6892874))
+
+### Fixed
+
+- *(assembly)* Drop the temp file when the assembly is dropped - ([9894bc0](https://github.com/QaidVoid/zsync-rs/commit/9894bc03d86f550ad3d1a8e2bbbb5e212ffa7ae4))
+
+### Other
+
+- Fix build provenance attestation and bump actions - ([c90c5f3](https://github.com/QaidVoid/zsync-rs/commit/c90c5f371e0ed4e269a3fd286f5f65302828edb0))
+- Use crates.io trusted publishing for release - ([932949c](https://github.com/QaidVoid/zsync-rs/commit/932949cf69036137e323ed6a56c377ecdba4758c))
+
 ## [0.1.4](https://github.com/QaidVoid/zsync-rs/compare/0.1.3...0.1.4) - 2026-08-20
 
 ### Added
