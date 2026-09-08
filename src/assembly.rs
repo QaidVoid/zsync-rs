@@ -511,13 +511,26 @@ impl ZsyncAssembly {
             }
         }
 
-        drop(self.file);
+        self.file.take();
         std::fs::rename(&self.temp_path, &self.output_path)?;
 
         Ok(())
     }
 
-    pub fn abort(self) {
+    /// Discards the assembly and its partial output.
+    ///
+    /// Equivalent to dropping it; both remove the temp file.
+    pub fn abort(self) {}
+}
+
+impl Drop for ZsyncAssembly {
+    /// Removes the temp file unless [`ZsyncAssembly::complete`] already renamed
+    /// it into place.
+    ///
+    /// Every failure path would otherwise leave a partial `.zsync-tmp` beside
+    /// the output. Nothing resumes from it: a later run builds a fresh matcher
+    /// that cannot tell which of its blocks are already written.
+    fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.temp_path);
     }
 }
