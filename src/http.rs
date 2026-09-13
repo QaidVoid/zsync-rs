@@ -1,4 +1,5 @@
 use std::io::Read;
+use std::time::Duration;
 
 use crate::control::ControlFile;
 
@@ -24,6 +25,25 @@ impl std::io::Read for HttpRangeReader {
     }
 }
 
+/// Cap on establishing a connection, covering the TCP handshake and TLS
+/// setup but never the transfer that follows.
+///
+/// ureq applies no connect timeout of its own, which leaves an address that
+/// silently drops SYNs costing the kernel's full retry schedule, around two
+/// minutes each. A mirror redirect that lands on a host with several such
+/// addresses stalls for as long as it takes to exhaust them all, and the
+/// error raised at the end is an unhelpful synthetic "connection refused".
+/// ureq divides this budget across the resolved addresses, so the cap is
+/// generous enough that a distant mirror still gets several seconds.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Cap on the DNS lookup, for the same reason as [`CONNECT_TIMEOUT`].
+///
+/// Deliberately the longer of the two. ureq attributes a timeout to whichever
+/// phase would have expired first, so an equal pair reports a connect failure
+/// as a resolve one and points whoever reads the error at the wrong thing.
+pub const RESOLVE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// HTTP transport for fetching control files and byte ranges.
 pub struct HttpClient {
     agent: ureq::Agent,
@@ -36,17 +56,23 @@ impl Default for HttpClient {
 }
 
 impl HttpClient {
-    /// A client with ureq's default policy, permitting plain HTTP.
+    /// A client permitting plain HTTP, with a bound on reaching a host.
     ///
     /// zsync is routinely served over HTTP and across mirror redirects, so
-    /// the defaults are permissive on purpose. An embedder with a stricter
-    /// policy, such as one that must refuse a downgrade to HTTP or pin its
-    /// own trust roots, should build an agent and pass it to
+    /// the scheme policy is permissive on purpose. An embedder with a
+    /// stricter one, such as one that must refuse a downgrade to HTTP or
+    /// pin its own trust roots, should build an agent and pass it to
     /// [`HttpClient::with_agent`] rather than relying on these.
+    ///
+    /// [`CONNECT_TIMEOUT`] and [`RESOLVE_TIMEOUT`] apply. Neither bounds the
+    /// transfer itself, so a mirror that trickles bytes for an hour is left
+    /// alone; they only cap how long a host that never answers can cost.
     pub fn new() -> Self {
         Self {
             agent: ureq::Agent::config_builder()
                 .https_only(false)
+                .timeout_connect(Some(CONNECT_TIMEOUT))
+                .timeout_resolve(Some(RESOLVE_TIMEOUT))
                 .build()
                 .new_agent(),
         }
@@ -218,6 +244,23 @@ mod tests {
             1024,
             "a range response must be capped at the requested length"
         );
+    }
+
+    #[test]
+    fn the_default_client_bounds_reaching_a_host_but_not_the_transfer() {
+        let timeouts = HttpClient::new().agent.config().timeouts();
+
+        // Unbounded, a host that drops SYNs costs the kernel's full retry
+        // schedule per resolved address, minutes at a time.
+        assert_eq!(timeouts.connect, Some(CONNECT_TIMEOUT));
+        assert_eq!(timeouts.resolve, Some(RESOLVE_TIMEOUT));
+
+        // Deliberately unbounded: mirrors serving a multi-hundred-megabyte
+        // image are often slow, and a cap here would abort a healthy but
+        // sluggish transfer.
+        assert_eq!(timeouts.global, None);
+        assert_eq!(timeouts.per_call, None);
+        assert_eq!(timeouts.recv_body, None);
     }
 
     #[test]
