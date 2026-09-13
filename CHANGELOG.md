@@ -1,4 +1,10 @@
 
+## [0.2.1](https://github.com/QaidVoid/zsync-rs/compare/0.2.0...0.2.1) - 2026-09-13
+
+### Fixed
+
+- *(http)* Bound connect and resolve, not the transfer - ([d0ae0da](https://github.com/QaidVoid/zsync-rs/commit/d0ae0da9f12969a63adcb533ba63f4a02befb226))
+
 ## [0.2.0](https://github.com/QaidVoid/zsync-rs/compare/0.1.4...0.2.0) - 2026-09-08
 
 ### Added
