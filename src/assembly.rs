@@ -1,6 +1,5 @@
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom};
-use std::os::unix::fs::FileExt;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -161,7 +160,7 @@ impl ZsyncAssembly {
     }
 
     pub fn submit_source_file(&mut self, path: &Path) -> Result<usize, AssemblyError> {
-        let file = File::open(path)?;
+        let mut file = File::open(path)?;
         let file_size = file.metadata()?.len() as usize;
 
         let blocksize = self.control.blocksize;
@@ -187,13 +186,14 @@ impl ZsyncAssembly {
             let overlap_len = file_offset - overlap_start;
 
             if overlap_len > 0 {
-                file.read_at(&mut buf[..overlap_len], overlap_start as u64)?;
+                Self::read_at_offset(&mut file, &mut buf[..overlap_len], overlap_start as u64)?;
             }
 
             let read_start = overlap_len;
             let read_len = chunk_size;
 
-            let bytes_read = file.read_at(
+            let bytes_read = Self::read_at_offset(
+                &mut file,
                 &mut buf[read_start..read_start + read_len],
                 file_offset as u64,
             )?;
@@ -205,7 +205,8 @@ impl ZsyncAssembly {
             let chunk_context = if file_offset + bytes_read < file_size {
                 let context_start = file_offset + bytes_read;
                 let context_available = file_size.saturating_sub(context_start).min(context);
-                file.read_at(
+                Self::read_at_offset(
+                    &mut file,
                     &mut buf[data_len..data_len + context_available],
                     context_start as u64,
                 )?;
@@ -283,13 +284,14 @@ impl ZsyncAssembly {
             let overlap_len = file_offset - overlap_start;
 
             if overlap_len > 0 {
-                file.read_at(&mut buf[..overlap_len], overlap_start as u64)?;
+                Self::read_at_offset(file, &mut buf[..overlap_len], overlap_start as u64)?;
             }
 
             let read_start = overlap_len;
             let read_len = chunk_size;
 
-            let bytes_read = file.read_at(
+            let bytes_read = Self::read_at_offset(
+                file,
                 &mut buf[read_start..read_start + read_len],
                 file_offset as u64,
             )?;
@@ -301,7 +303,8 @@ impl ZsyncAssembly {
             let chunk_context = if file_offset + bytes_read < file_size {
                 let context_start = file_offset + bytes_read;
                 let context_available = file_size.saturating_sub(context_start).min(context);
-                file.read_at(
+                Self::read_at_offset(
+                    file,
                     &mut buf[data_len..data_len + context_available],
                     context_start as u64,
                 )?;
@@ -345,8 +348,18 @@ impl ZsyncAssembly {
         Ok(total_matched)
     }
 
-    fn write_at_offset(file: &File, data: &[u8], offset: u64) -> Result<(), AssemblyError> {
-        file.write_all_at(data, offset)?;
+    fn read_at_offset(
+        file: &mut File,
+        data: &mut [u8],
+        offset: u64,
+    ) -> Result<usize, AssemblyError> {
+        file.seek(SeekFrom::Start(offset))?;
+        Ok(file.read(data)?)
+    }
+
+    fn write_at_offset(file: &mut File, data: &[u8], offset: u64) -> Result<(), AssemblyError> {
+        file.seek(SeekFrom::Start(offset))?;
+        file.write_all(data)?;
         Ok(())
     }
 
