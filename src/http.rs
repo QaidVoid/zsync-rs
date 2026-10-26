@@ -6,7 +6,10 @@
 //! re-downloads a few known bytes is usually cheaper than another round trip.
 
 use std::io::Read;
+use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
+
+use ureq::ResponseExt;
 
 use crate::control::{ControlFile, ParseError};
 
@@ -120,8 +123,14 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 pub const RESOLVE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// HTTP transport for fetching control files and byte ranges.
+///
+/// The client remembers where the last range URL redirected to and sends
+/// later ranges of that URL straight there. Many hosts redirect every
+/// download to a signed storage URL, and following the redirect again for
+/// each range would add a round trip to every request.
 pub struct HttpClient {
     agent: ureq::Agent,
+    redirect: Mutex<Option<(String, String)>>,
 }
 
 impl Default for HttpClient {
@@ -143,14 +152,14 @@ impl HttpClient {
     /// transfer itself, so a mirror that trickles bytes for an hour is left
     /// alone; they only cap how long a host that never answers can cost.
     pub fn new() -> Self {
-        Self {
-            agent: ureq::Agent::config_builder()
+        Self::with_agent(
+            ureq::Agent::config_builder()
                 .https_only(false)
                 .timeout_connect(Some(CONNECT_TIMEOUT))
                 .timeout_resolve(Some(RESOLVE_TIMEOUT))
                 .build()
                 .new_agent(),
-        }
+        )
     }
 
     /// A client using a caller-supplied agent.
@@ -160,7 +169,10 @@ impl HttpClient {
     /// keeps that decision with the embedder, which is the only place that
     /// knows what the transferred bytes are trusted for.
     pub fn with_agent(agent: ureq::Agent) -> Self {
-        Self { agent }
+        Self {
+            agent,
+            redirect: Mutex::new(None),
+        }
     }
 
     /// Fetches and parses the control file at `url`.
@@ -193,6 +205,11 @@ impl HttpClient {
     /// that answers `200` has ignored `Range` and sends the file from its
     /// first byte, which is right for such a range and wrong for any other.
     ///
+    /// When an earlier range of `url` was redirected, the request goes to
+    /// the redirect target directly. If the target answers with an error
+    /// status, as a signed URL does once it expires, the request is made
+    /// again to `url`.
+    ///
     /// # Errors
     ///
     /// Returns [`HttpError::Request`] when the request fails,
@@ -205,10 +222,42 @@ impl HttpClient {
         start: u64,
         end: u64,
     ) -> Result<HttpRangeReader, HttpError> {
+        let target = self
+            .remembered_redirect()
+            .and_then(|(from, to)| (from == url).then_some(to));
+        if let Some(target) = target {
+            match self.open_range(&target, start, end) {
+                Err(HttpError::Status(_)) => {}
+                result => return result.map(|(reader, _)| reader),
+            }
+        }
+
+        let (reader, final_url) = self.open_range(url, start, end)?;
+        *self.redirect.lock().unwrap_or_else(PoisonError::into_inner) =
+            (final_url != url).then(|| (url.to_string(), final_url));
+        Ok(reader)
+    }
+
+    fn remembered_redirect(&self) -> Option<(String, String)> {
+        self.redirect
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Requests a range of `url`, returning its body and the URL that
+    /// finally answered after any redirects.
+    fn open_range(
+        &self,
+        url: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<(HttpRangeReader, String), HttpError> {
         let range_header = format!("bytes={}-{}", start, end);
         let requested = end.saturating_sub(start).saturating_add(1);
 
         let response = self.agent.get(url).header("Range", &range_header).call()?;
+        let final_url = response.get_uri().to_string();
 
         let status = response.status();
         if status == 200 && start > 0 {
@@ -218,10 +267,11 @@ impl HttpClient {
             return Err(HttpError::Status(status.as_u16()));
         }
 
-        Ok(HttpRangeReader {
+        let reader = HttpRangeReader {
             reader: Box::new(response.into_body().into_reader()),
             remaining: requested,
-        })
+        };
+        Ok((reader, final_url))
     }
 
     /// Fetches `start..=end` of `url` into memory.
@@ -485,6 +535,105 @@ mod tests {
             connections.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "each range request opened its own connection"
+        );
+    }
+
+    /// A server where `/f` redirects to `/signed/<generation>`, as a host
+    /// redirects a download to a signed storage URL. Only the
+    /// current generation is served, so raising it expires earlier targets.
+    /// Returns the URL, the generation, and how many times `/f` was asked.
+    fn redirecting_server() -> (
+        String,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use std::io::{BufRead, Write};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let generation = Arc::new(AtomicUsize::new(1));
+        let redirects = Arc::new(AtomicUsize::new(0));
+        let (current, asked) = (generation.clone(), redirects.clone());
+        std::thread::spawn(move || {
+            for sock in listener.incoming().flatten() {
+                let mut reader = std::io::BufReader::new(sock.try_clone().unwrap());
+                let mut sock = sock;
+                let mut request = String::new();
+                let _ = reader.read_line(&mut request);
+                let mut range = (0u64, 0u64);
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    if let Some(spec) = line.to_ascii_lowercase().strip_prefix("range: bytes=") {
+                        let (a, b) = spec.trim().split_once('-').unwrap();
+                        range = (a.parse().unwrap(), b.parse().unwrap());
+                    }
+                }
+                let path = request.split_whitespace().nth(1).unwrap_or("").to_string();
+                let now = current.load(Ordering::SeqCst);
+                let response = if path == "/f" {
+                    asked.fetch_add(1, Ordering::SeqCst);
+                    format!(
+                        "HTTP/1.1 302 Found\r\nLocation: /signed/{now}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                    .into_bytes()
+                } else if path == format!("/signed/{now}") {
+                    let len = range.1 - range.0 + 1;
+                    let mut r = format!(
+                        "HTTP/1.1 206 Partial Content\r\nContent-Length: {len}\r\nContent-Range: bytes {}-{}/1048576\r\nConnection: close\r\n\r\n",
+                        range.0, range.1
+                    )
+                    .into_bytes();
+                    r.extend((range.0..=range.1).map(|i| i as u8));
+                    r
+                } else {
+                    b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        .to_vec()
+                };
+                let _ = sock.write_all(&response);
+            }
+        });
+        (format!("http://{addr}/f"), generation, redirects)
+    }
+
+    #[test]
+    fn a_redirect_is_followed_once_for_many_ranges() {
+        use std::sync::atomic::Ordering;
+        let (url, _, redirects) = redirecting_server();
+        let client = HttpClient::new();
+        for i in 0..4u64 {
+            let start = i * 1000;
+            let data = client.fetch_range(&url, start, start + 99).expect("fetch");
+            assert_eq!(
+                data,
+                (start..start + 100).map(|b| b as u8).collect::<Vec<_>>()
+            );
+        }
+        assert_eq!(redirects.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn an_expired_redirect_target_is_resolved_again() {
+        use std::sync::atomic::Ordering;
+        let (url, generation, redirects) = redirecting_server();
+        let client = HttpClient::new();
+        client.fetch_range(&url, 0, 99).expect("first fetch");
+
+        generation.store(2, Ordering::SeqCst);
+        let data = client
+            .fetch_range(&url, 500, 599)
+            .expect("an expired target must fall back to the original URL");
+        assert_eq!(data, (500..600u64).map(|b| b as u8).collect::<Vec<_>>());
+        assert_eq!(redirects.load(Ordering::SeqCst), 2);
+
+        client.fetch_range(&url, 700, 799).expect("fetch");
+        assert_eq!(
+            redirects.load(Ordering::SeqCst),
+            2,
+            "the new target was not kept"
         );
     }
 
