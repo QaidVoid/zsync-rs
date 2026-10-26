@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::BufWriter;
+use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 
 use clap::Parser;
@@ -67,7 +67,12 @@ fn main() {
         }
     };
 
-    if let Err(e) = control.write(&mut BufWriter::new(output)) {
+    // An explicit flush, because dropping a `BufWriter` discards its error.
+    let mut writer = BufWriter::new(output);
+    if let Err(e) = control
+        .write(&mut writer)
+        .and_then(|()| Ok(writer.flush()?))
+    {
         eprintln!("Error writing control file: {e}");
         std::process::exit(1);
     }

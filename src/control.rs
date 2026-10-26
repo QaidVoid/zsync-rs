@@ -13,10 +13,19 @@ use std::io::{BufRead, Read, Seek, SeekFrom, Write};
 use crate::checksum::{calc_md4, calc_sha1_stream};
 use crate::rsum::{Rsum, calc_rsum_block};
 
+/// The largest block size a control file may use, 1 MiB.
+///
+/// The client allocates buffers a few blocks long, and the block size comes
+/// from a file fetched over the network, so without a bound a single header
+/// line could make it reserve any amount of memory. `zsyncmake` picks 2048 or
+/// 4096 on its own, so the cap leaves ample room above that.
+pub const MAX_BLOCKSIZE: usize = 1 << 20;
+
 /// Why [`ControlFile::generate`] could not describe a file.
 #[derive(Debug, thiserror::Error)]
 pub enum GenerateError {
-    /// Reading or seeking the input failed.
+    /// Reading or seeking the input failed, or the block size was invalid,
+    /// which is reported as [`std::io::ErrorKind::InvalidInput`].
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
     /// The input has no bytes, and a control file cannot describe a target
@@ -45,7 +54,8 @@ pub enum ParseError {
     /// A header the format requires, named here, is absent.
     #[error("Missing required field: {0}")]
     MissingField(String),
-    /// `Blocksize` is not a number or not a power of two.
+    /// `Blocksize` is not a number, not a power of two, or larger than
+    /// [`MAX_BLOCKSIZE`].
     #[error("Invalid blocksize: {0}")]
     InvalidBlocksize(String),
     /// `Hash-Lengths` is not three comma-separated numbers within the ranges
@@ -195,7 +205,7 @@ impl ControlFile {
                     let bs: usize = value
                         .parse()
                         .map_err(|_| ParseError::InvalidBlocksize(value.to_string()))?;
-                    if bs == 0 || (bs & (bs - 1)) != 0 {
+                    if !bs.is_power_of_two() || bs > MAX_BLOCKSIZE {
                         return Err(ParseError::InvalidBlocksize(value.to_string()));
                     }
                     blocksize = Some(bs);
@@ -336,15 +346,16 @@ impl ControlFile {
     /// Every block is checksummed, with the last one padded with zeros to a
     /// full block, and the whole input is hashed with SHA-1. A `blocksize` of
     /// `None` picks 2048 bytes for inputs under 100,000,000 bytes and 4096
-    /// otherwise. A given size must be a power of two, or the result will not
-    /// parse. The hash lengths are derived from the file and block sizes
+    /// otherwise. A given size must be a power of two no larger than
+    /// [`MAX_BLOCKSIZE`], the sizes [`Self::parse`] accepts. The hash lengths are derived from the file and block sizes
     /// with the formulas `zsyncmake` uses, `url` becomes the only URL, and
     /// the version is written as `0.6.2`.
     ///
     /// # Errors
     ///
     /// Returns [`GenerateError::EmptyFile`] for an empty input and
-    /// [`GenerateError::Io`] when reading or seeking fails.
+    /// [`GenerateError::Io`] when reading or seeking fails or the block size
+    /// is invalid.
     pub fn generate<R: Read + Seek>(
         reader: &mut R,
         filename: &str,
@@ -358,6 +369,12 @@ impl ControlFile {
         reader.seek(SeekFrom::Start(0))?;
 
         let blocksize = blocksize.unwrap_or_else(|| auto_blocksize(file_length));
+        if !blocksize.is_power_of_two() || blocksize > MAX_BLOCKSIZE {
+            return Err(GenerateError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("block size {blocksize} is not a power of two up to {MAX_BLOCKSIZE}"),
+            )));
+        }
         let hash_lengths = calculate_hash_lengths(file_length, blocksize);
         let num_blocks = file_length.div_ceil(blocksize as u64) as usize;
 
@@ -409,7 +426,9 @@ impl ControlFile {
     /// Write the control file to a writer.
     ///
     /// The block records are written at the lengths [`Self::hash_lengths`]
-    /// gives, so a file written here parses back to the same checksums.
+    /// gives, so a file written here parses back to the same checksums. The
+    /// writer is not flushed, so a buffered one must be flushed by the caller
+    /// to see a late write error.
     ///
     /// # Errors
     ///
@@ -585,6 +604,24 @@ mod tests {
     }
 
     #[test]
+    fn a_block_size_past_the_cap_is_refused() {
+        let header = |bs: usize| {
+            let mut data =
+                format!("zsync: 0.6.2\nBlocksize: {bs}\nLength: 1\nHash-Lengths: 1,4,16\n\n")
+                    .into_bytes();
+            data.extend_from_slice(&[0u8; 20]);
+            data
+        };
+
+        assert!(ControlFile::parse(&header(MAX_BLOCKSIZE)[..]).is_ok());
+        let err = ControlFile::parse(&header(MAX_BLOCKSIZE * 2)[..]).expect_err("past the cap");
+        assert!(
+            matches!(err, ParseError::InvalidBlocksize(_)),
+            "expected a blocksize error, got: {err}"
+        );
+    }
+
+    #[test]
     fn test_generate_write_roundtrip() {
         let file_data = vec![42u8; 4096];
         let mut cursor = std::io::Cursor::new(&file_data);
@@ -610,6 +647,19 @@ mod tests {
             let b_bytes = rsum_to_bytes(b.rsum, rlen);
             assert_eq!(a_bytes, b_bytes);
             assert_eq!(a.checksum[..clen], b.checksum[..clen]);
+        }
+    }
+
+    #[test]
+    fn an_invalid_block_size_is_refused_when_generating() {
+        for bs in [0, 1000, MAX_BLOCKSIZE * 2] {
+            let mut cursor = std::io::Cursor::new(vec![1u8; 4096]);
+            let err = ControlFile::generate(&mut cursor, "f", "f", Some(bs))
+                .expect_err("invalid block size accepted");
+            assert!(
+                matches!(&err, GenerateError::Io(e) if e.kind() == std::io::ErrorKind::InvalidInput),
+                "block size {bs}: {err}"
+            );
         }
     }
 

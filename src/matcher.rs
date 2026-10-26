@@ -30,6 +30,19 @@ struct TargetBlock {
     checksum: [u8; 16],
 }
 
+/// The contribution of a byte leaving the window to the rolling `b` sum,
+/// which is the byte shifted left by `log2(blocksize)`, modulo 2^16.
+///
+/// A plain `u16` shift overflows once the block size reaches 64 KiB, which
+/// panics in debug builds and wraps the shift amount in release, so the
+/// rolling sum stops matching blocks at unaligned offsets.
+#[inline(always)]
+fn shifted_out(byte: u8, blockshift: u8) -> u16 {
+    u16::from(byte)
+        .checked_shl(u32::from(blockshift))
+        .unwrap_or(0)
+}
+
 /// Read-only scan state shared across threads.
 struct ScanState<'a> {
     targets: &'a [TargetBlock],
@@ -166,7 +179,7 @@ impl ScanState<'_> {
                     r0.a = r0.a.wrapping_add(u16::from(nc)).wrapping_sub(u16::from(oc));
                     r0.b =
                         r0.b.wrapping_add(r0.a)
-                            .wrapping_sub(u16::from(oc) << blockshift);
+                            .wrapping_sub(shifted_out(oc, blockshift));
 
                     if seq_matches > 1 {
                         let nc2 = data[x + blocksize * 2];
@@ -175,7 +188,7 @@ impl ScanState<'_> {
                                 .wrapping_sub(u16::from(nc));
                         r1.b =
                             r1.b.wrapping_add(r1.a)
-                                .wrapping_sub(u16::from(nc) << blockshift);
+                                .wrapping_sub(shifted_out(nc, blockshift));
                     }
 
                     x += 1;
@@ -217,6 +230,9 @@ pub struct BlockMatcher {
     hash_func_shift: u32,
     targets: Vec<TargetBlock>,
     known_blocks: Vec<bool>,
+    /// How many entries of `known_blocks` are set, kept so that progress
+    /// queries after every downloaded block do not rescan the whole vector.
+    known_count: usize,
     hash_table: Vec<u32>,
     hash_next: Vec<u32>,
     hash_mask: u32,
@@ -286,6 +302,7 @@ impl BlockMatcher {
             hash_func_shift,
             targets,
             known_blocks: vec![false; num_blocks],
+            known_count: 0,
             hash_table: vec![HASH_EMPTY; (hash_mask + 1) as usize],
             hash_next: vec![HASH_EMPTY; num_blocks],
             hash_mask,
@@ -341,6 +358,13 @@ impl BlockMatcher {
         }
     }
 
+    fn mark_known(&mut self, block_id: usize) {
+        if !self.known_blocks[block_id] {
+            self.known_blocks[block_id] = true;
+            self.known_count += 1;
+        }
+    }
+
     fn scan_state(&self) -> ScanState<'_> {
         ScanState {
             targets: &self.targets,
@@ -385,7 +409,7 @@ impl BlockMatcher {
 
             let checksum = calc_md4(block_data);
             if checksum[..checksum_bytes] == self.targets[block_id].checksum[..checksum_bytes] {
-                self.known_blocks[block_id] = true;
+                self.mark_known(block_id);
             } else {
                 return Ok(false);
             }
@@ -456,7 +480,7 @@ impl BlockMatcher {
         for (block_id, offset) in candidates {
             if !seen[block_id] {
                 seen[block_id] = true;
-                self.known_blocks[block_id] = true;
+                self.mark_known(block_id);
                 self.remove_block_from_hash(block_id);
                 matched_blocks.push((block_id, offset));
             }
@@ -495,12 +519,12 @@ impl BlockMatcher {
 
     /// The number of blocks still unknown.
     pub fn blocks_todo(&self) -> usize {
-        self.known_blocks.iter().filter(|&&k| !k).count()
+        self.known_blocks.len() - self.known_count
     }
 
     /// Whether every block is known.
     pub fn is_complete(&self) -> bool {
-        self.known_blocks.iter().all(|&k| k)
+        self.known_count == self.known_blocks.len()
     }
 
     /// The number of blocks in the target.
@@ -567,6 +591,50 @@ mod tests {
         let got = matcher.submit_source_data(&padded, 0);
         assert_eq!(got.len(), 3);
         assert!(matcher.is_complete());
+    }
+
+    #[test]
+    fn large_blocks_match_at_unaligned_offsets() {
+        // 64 KiB blocks shift the leaving byte by 16, past the width of the
+        // rolling sum. The seed starts one byte late, so every match needs
+        // the rolling update to be right.
+        let blocksize = 64 * 1024;
+        let data: Vec<u8> = (0..blocksize as u32 * 3)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+        let control = make_control(&data, blocksize);
+        let mut matcher = BlockMatcher::new(&control);
+
+        let mut seed = vec![0xAA];
+        seed.extend_from_slice(&data);
+        seed.resize(seed.len() + blocksize, 0);
+        let found = matcher.submit_source_data(&seed, 0);
+
+        assert_eq!(found.len(), 3, "found {found:?}");
+        assert!(
+            found
+                .iter()
+                .all(|&(id, offset)| offset == id * blocksize + 1)
+        );
+    }
+
+    #[test]
+    fn a_block_known_twice_is_counted_once() {
+        let data: Vec<u8> = (0..16u8).collect();
+        let control = make_control(&data, 4);
+        let mut matcher = BlockMatcher::new(&control);
+
+        // Block 1 verified by download, then found again by a scan that
+        // covers it. Counting it twice would report completion early.
+        assert!(matcher.submit_blocks(&data[4..8], 1).unwrap());
+        assert!(matcher.submit_blocks(&data[4..8], 1).unwrap());
+        assert_eq!(matcher.blocks_todo(), 3);
+
+        let mut padded = data[..8].to_vec();
+        padded.resize(12, 0);
+        matcher.submit_source_data(&padded, 0);
+        assert_eq!(matcher.blocks_todo(), 2);
+        assert!(!matcher.is_complete());
     }
 
     #[test]

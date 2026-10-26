@@ -118,7 +118,8 @@ impl HttpClient {
             .map_err(|e| HttpError::Http(e.to_string()))?;
 
         let mut reader = response.into_body().into_reader();
-        ControlFile::parse(&mut reader).map_err(|e| HttpError::Http(e.to_string()))
+        ControlFile::parse(&mut reader)
+            .map_err(|e| HttpError::Http(format!("invalid control file: {e}")))
     }
 
     /// A reader over `start..=end` of `url`.
@@ -129,15 +130,15 @@ impl HttpClient {
     /// as block assembly, grow a buffer to match. Bytes past the range
     /// were never asked for and are of no use, so they are not read.
     ///
-    /// A `200 OK` is accepted as well as `206 Partial Content`. A server that
-    /// ignores `Range` sends the file from its first byte, so for a range
-    /// that does not start at zero the reader yields the wrong bytes, and it
-    /// falls to the caller's block checksums to reject them.
+    /// A `200 OK` is accepted only for a range starting at zero. A server
+    /// that answers `200` has ignored `Range` and sends the file from its
+    /// first byte, which is right for such a range and wrong for any other.
     ///
     /// # Errors
     ///
-    /// Returns [`HttpError::Http`] when the request fails or the status is
-    /// neither 200 nor 206.
+    /// Returns [`HttpError::Http`] when the request fails, when the status is
+    /// neither 200 nor 206, or when it is 200 for a range that does not start
+    /// at zero.
     pub fn fetch_range_reader(
         &self,
         url: &str,
@@ -155,6 +156,11 @@ impl HttpClient {
             .map_err(|e| HttpError::Http(e.to_string()))?;
 
         let status = response.status();
+        if status == 200 && start > 0 {
+            return Err(HttpError::Http(
+                "server ignored the Range header, so it cannot serve partial downloads".to_string(),
+            ));
+        }
         if status != 206 && status != 200 {
             return Err(HttpError::Http(format!(
                 "Expected 206 Partial Content, got {}",
@@ -291,6 +297,45 @@ mod tests {
             }
         });
         format!("http://{}/f", addr)
+    }
+
+    /// A server that ignores `Range` and answers every request with `200`
+    /// and the whole body, as a plain static file server without range
+    /// support does.
+    fn range_ignoring_server(body_len: usize) -> String {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for mut sock in listener.incoming().flatten() {
+                let mut req = [0u8; 1024];
+                let _ = std::io::Read::read(&mut sock, &mut req);
+                let hdr = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {body_len}\r\nConnection: close\r\n\r\n"
+                );
+                let _ = sock.write_all(hdr.as_bytes());
+                let _ = sock.write_all(&vec![0u8; body_len]);
+            }
+        });
+        format!("http://{}/f", addr)
+    }
+
+    #[test]
+    fn a_full_response_to_a_later_range_is_refused() {
+        let url = range_ignoring_server(4096);
+        let client = HttpClient::new();
+
+        // From byte zero the whole body is the right data.
+        assert_eq!(
+            client.fetch_range(&url, 0, 1023).expect("fetch").len(),
+            1024
+        );
+
+        // From anywhere else it is the wrong data, so it must not be read.
+        let err = client
+            .fetch_range(&url, 2048, 3071)
+            .expect_err("a 200 for a later range must be refused");
+        assert!(err.to_string().contains("Range"), "unexpected error: {err}");
     }
 
     #[test]

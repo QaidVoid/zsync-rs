@@ -17,8 +17,8 @@ path = "src/bin/zsyncmake.rs"
 
 [dependencies]
 thiserror = "2.0.18"
-md4 = "0.11.0-rc.2"
-sha1 = "0.11.0-rc.5"
+md4 = "0.11"
+sha1 = "0.11"
 ureq = { version = "3.2.1" }
 clap = { version = "4.6.0", features = ["derive"] }
 

@@ -280,6 +280,15 @@ fn json_escape(input: &str) -> String {
     out
 }
 
+/// The output name for `url` when none is given: its last path segment,
+/// without any query, fragment or `.zsync` suffix.
+fn default_output(url: &str) -> PathBuf {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    let name = path.rsplit('/').next().unwrap_or(path);
+    let name = name.strip_suffix(".zsync").unwrap_or(name);
+    PathBuf::from(if name.is_empty() { "output" } else { name })
+}
+
 fn main() {
     let cli = Cli::parse();
     let mode = if cli.json {
@@ -290,15 +299,7 @@ fn main() {
         Mode::Lines
     };
 
-    let output_path = cli.output.unwrap_or_else(|| {
-        PathBuf::from(
-            cli.url
-                .trim_end_matches(".zsync")
-                .rsplit('/')
-                .next()
-                .unwrap_or("output"),
-        )
-    });
+    let output_path = cli.output.unwrap_or_else(|| default_output(&cli.url));
 
     let reporter = Arc::new(Mutex::new(Reporter::new(mode)));
 
@@ -314,7 +315,7 @@ fn main() {
         }
     };
 
-    assembly.set_range_gap_threshold(cli.range_gap * 1024);
+    assembly.set_range_gap_threshold(cli.range_gap.saturating_mul(1024));
 
     {
         let (_, total_bytes) = assembly.progress();
@@ -418,6 +419,24 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_output_is_the_last_segment_without_the_suffix() {
+        let name = |url| default_output(url).display().to_string();
+        assert_eq!(name("https://h/a/app.AppImage.zsync"), "app.AppImage");
+        assert_eq!(name("https://h/a/app.zsync?sig=x/y&e=1"), "app");
+        assert_eq!(name("https://h/a/app.zsync#part"), "app");
+        assert_eq!(name("https://h/a/"), "output");
+    }
+
+    #[test]
+    fn json_escape_covers_what_a_path_or_message_can_hold() {
+        assert_eq!(json_escape(r#"a"b"#), r#"a\"b"#);
+        assert_eq!(json_escape(r"C:\dir\f.bin"), r"C:\\dir\\f.bin");
+        assert_eq!(json_escape("line\nnext\ttab\r"), r"line\nnext\ttab\r");
+        assert_eq!(json_escape("\u{1}"), r"\u0001");
+        assert_eq!(json_escape("ünïcode"), "ünïcode");
+    }
 
     #[test]
     fn bar_fills_in_proportion_to_progress() {

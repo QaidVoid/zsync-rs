@@ -6,9 +6,10 @@
 //! verified one at a time. Last, [`ZsyncAssembly::complete`] checks the whole
 //! file against the control file's SHA-1 and renames it into place.
 //!
-//! The temporary file is the output path with its extension replaced by
-//! `zsync-tmp`. Dropping the assembly before it completes removes it, so a
-//! failed or abandoned transfer leaves nothing behind.
+//! The temporary file is the output path with `.zsync-tmp` appended, so
+//! outputs that differ only in their extension never share one. Dropping the
+//! assembly before it completes removes it, so a failed or abandoned transfer
+//! leaves nothing behind.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -34,7 +35,7 @@ pub enum AssemblyError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
     /// Fetching the control file or a block range failed.
-    #[error("HTTP error: {0}")]
+    #[error(transparent)]
     Http(#[from] crate::http::HttpError),
     /// The block matcher failed.
     #[error("Matcher error: {0}")]
@@ -117,7 +118,9 @@ impl ZsyncAssembly {
         http: HttpClient,
     ) -> Result<Self, AssemblyError> {
         let matcher = BlockMatcher::new(&control);
-        let temp_path = output_path.with_extension("zsync-tmp");
+        let mut temp_path = output_path.as_os_str().to_owned();
+        temp_path.push(".zsync-tmp");
+        let temp_path = std::path::PathBuf::from(temp_path);
 
         Ok(Self {
             control,
@@ -704,6 +707,24 @@ fn resolve_url(base: &str, relative: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn outputs_differing_in_extension_get_their_own_temp_file() {
+        let mut header = b"zsync: 0.6.2\nBlocksize: 2048\nLength: 1\n\n".to_vec();
+        header.extend_from_slice(&[0u8; 20]);
+        let control = ControlFile::parse(&header[..]).expect("parse");
+
+        let iso = ZsyncAssembly::new(control.clone(), Path::new("dir/x.iso")).expect("iso");
+        let img = ZsyncAssembly::new(control, Path::new("dir/x.img")).expect("img");
+        assert_eq!(iso.temp_path, Path::new("dir/x.iso.zsync-tmp"));
+        assert_eq!(img.temp_path, Path::new("dir/x.img.zsync-tmp"));
+    }
+
+    #[test]
+    fn a_wrapped_http_error_is_not_prefixed_twice() {
+        let err = AssemblyError::from(crate::http::HttpError::Http("timed out".to_string()));
+        assert_eq!(err.to_string(), "HTTP error: timed out");
+    }
 
     #[test]
     fn test_hex_encode() {
