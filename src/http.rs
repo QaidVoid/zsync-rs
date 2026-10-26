@@ -118,7 +118,8 @@ impl HttpClient {
             .map_err(|e| HttpError::Http(e.to_string()))?;
 
         let mut reader = response.into_body().into_reader();
-        ControlFile::parse(&mut reader).map_err(|e| HttpError::Http(e.to_string()))
+        ControlFile::parse(&mut reader)
+            .map_err(|e| HttpError::Http(format!("invalid control file: {e}")))
     }
 
     /// A reader over `start..=end` of `url`.

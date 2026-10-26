@@ -34,7 +34,7 @@ pub enum AssemblyError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
     /// Fetching the control file or a block range failed.
-    #[error("HTTP error: {0}")]
+    #[error(transparent)]
     Http(#[from] crate::http::HttpError),
     /// The block matcher failed.
     #[error("Matcher error: {0}")]
@@ -704,6 +704,12 @@ fn resolve_url(base: &str, relative: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_wrapped_http_error_is_not_prefixed_twice() {
+        let err = AssemblyError::from(crate::http::HttpError::Http("timed out".to_string()));
+        assert_eq!(err.to_string(), "HTTP error: timed out");
+    }
 
     #[test]
     fn test_hex_encode() {
