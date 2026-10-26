@@ -45,12 +45,21 @@ zsync https://example.com/file.zsync -o output.bin
 
 ### Progress output
 
-The CLI reports progress during the download, updated at most every 100 ms.
-On a terminal it draws a single bar that redraws in place:
+The CLI reports progress while it scans each seed file given with `-i`,
+while it rescans the assembled data for repeated blocks, and during the
+download, updated at most every 100 ms. On a terminal it draws a single bar
+that redraws in place:
 
 ```
+Scanning old.AppImage...
+  [##############################] 100%  286.10 MB / 286.10 MB
+Matched 48828 blocks from old.AppImage (66.67%)
+Scanning for repeated blocks...
+  [##############################] 100%  190.73 MB / 190.73 MB
+Target: 286.10 MB (73243 blocks) - 66.67% complete
+Need to download: 95.37 MB
 Downloading missing blocks...
-  [#############                 ]  45%  8.62 MB / 19.07 MB
+  [#############                 ]  45%  128.75 MB / 286.10 MB
 ```
 
 When stderr is redirected to a file or a pipe, it prints one line per update
@@ -69,17 +78,25 @@ or a UI to consume. Human-readable messages stay on stderr, so stdout carries
 nothing but JSON:
 
 ```json
-{"event":"start","total_bytes":20000000,"total_blocks":9766,"blocksize":2048}
-{"event":"progress","phase":"download","done_bytes":1816576,"total_bytes":20000000,"elapsed_ms":105}
-{"event":"progress","phase":"download","done_bytes":20000000,"total_bytes":20000000,"elapsed_ms":1112,"final":true}
+{"event":"start","total_bytes":300000000,"total_blocks":73243,"blocksize":4096}
+{"event":"progress","phase":"scan","file":"old.AppImage","done_bytes":1048576,"total_bytes":300000000,"elapsed_ms":6}
+{"event":"progress","phase":"scan","file":"old.AppImage","done_bytes":300000000,"total_bytes":300000000,"elapsed_ms":879,"final":true}
+{"event":"progress","phase":"self_scan","done_bytes":1048576,"total_bytes":199999488,"elapsed_ms":884}
+{"event":"progress","phase":"self_scan","done_bytes":199999488,"total_bytes":199999488,"elapsed_ms":1802,"final":true}
+{"event":"progress","phase":"download","done_bytes":200003584,"total_bytes":300000000,"elapsed_ms":1803}
+{"event":"progress","phase":"download","done_bytes":300000000,"total_bytes":300000000,"elapsed_ms":6953,"final":true}
 {"event":"phase","phase":"verify"}
-{"event":"done","path":"output.bin"}
+{"event":"done","path":"app.AppImage"}
 ```
 
 Every line is one JSON object with an `event` field. The events are `start`,
-`progress`, `phase`, `done`, and `error`. The last `progress` event always
-carries `"final":true` and the completed byte count, whatever the throttle
-allowed through.
+`progress`, `phase`, `done`, and `error`. A `progress` event's `phase` is
+`scan` for a seed file, which it names in `file`, `self_scan` for the rescan
+of the assembled data, or `download`. In a scan, the byte counts are of the
+file being scanned; in the download, they are of the target. Each phase ends
+with a `progress` event carrying `"final":true` and its completed count,
+whatever the throttle allowed through. A seed too small to hold a block
+reports no scan events.
 
 ## Library Usage
 

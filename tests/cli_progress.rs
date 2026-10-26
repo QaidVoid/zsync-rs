@@ -368,8 +368,8 @@ fn a_complete_seed_reports_progress_without_downloading() {
     assert!(stdout.contains("\"event\":\"start\""));
     let final_progress = stdout
         .lines()
-        .find(|l| l.contains("\"final\":true"))
-        .expect("no final progress event");
+        .find(|l| l.contains("\"phase\":\"download\"") && l.contains("\"final\":true"))
+        .expect("no final download event");
     assert!(
         final_progress.contains("\"done_bytes\":200000"),
         "complete seed did not report full progress: {final_progress}"
@@ -398,8 +398,14 @@ fn human_mode_prints_no_progress_when_nothing_downloads() {
     ]);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "zsync failed: {stderr}");
+
+    // The seed scan reports progress; the download that follows must not.
+    let after_scan = stderr
+        .split_once("Need to download")
+        .map(|(_, rest)| rest)
+        .expect("no download summary");
     assert!(
-        !stderr
+        !after_scan
             .lines()
             .any(|l| l.starts_with("  ") && l.contains(" / ")),
         "progress line printed without a download:\n{stderr}"
@@ -448,6 +454,70 @@ fn a_failed_download_removes_the_temp_file() {
     assert!(
         !dir.join("out.bin.zsync-tmp").exists(),
         "temp file left behind after a failed download"
+    );
+
+    shutdown.store(true, Ordering::Relaxed);
+    server.join().ok();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn json_mode_reports_seed_scan_progress_before_the_download() {
+    // Over 2 MiB, so the scan reads several 1 MiB chunks. The last 64 KiB
+    // differ from the seed, so a download still follows the scan.
+    let len = 2_200_000u32;
+    let body: Vec<u8> = (0..len).map(|i| (i % 241) as u8).collect();
+    let dir = temp_dir("scan-json");
+    let (control_url, shutdown, server) = origin(&dir, &body);
+
+    let mut seed_bytes = body.clone();
+    let tail = seed_bytes.len() - 64 * 1024;
+    seed_bytes[tail..].fill(0xEE);
+    let seed = dir.join("seed.bin");
+    std::fs::write(&seed, &seed_bytes).expect("write seed");
+
+    let out_path = dir.join("out.bin");
+    let out = zsync(&[
+        &control_url,
+        "-i",
+        seed.to_str().expect("path"),
+        "-o",
+        out_path.to_str().expect("path"),
+        "--json",
+    ]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "zsync failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let lines: Vec<&str> = stdout.lines().collect();
+    let scan: Vec<usize> = (0..lines.len())
+        .filter(|&i| lines[i].contains("\"phase\":\"scan\""))
+        .collect();
+    let first_download = lines
+        .iter()
+        .position(|l| l.contains("\"phase\":\"download\""))
+        .expect("no download events");
+
+    assert!(
+        scan.len() > 1,
+        "expected progress during the scan: {stdout}"
+    );
+    assert!(
+        scan.iter().all(|&i| i < first_download),
+        "scan events must come before the download: {stdout}"
+    );
+    assert!(
+        scan.iter().all(|&i| lines[i].contains("seed.bin")),
+        "scan events must name the seed: {stdout}"
+    );
+    let last_scan = lines[*scan.last().expect("scan")];
+    assert!(
+        last_scan.contains("\"final\":true")
+            && last_scan.contains(&format!("\"done_bytes\":{len}")),
+        "the scan must end with the whole seed: {last_scan}"
     );
 
     shutdown.store(true, Ordering::Relaxed);

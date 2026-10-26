@@ -83,6 +83,7 @@ pub struct ZsyncAssembly {
     file: Option<File>,
     range_gap_threshold: u64,
     progress_callback: Option<ProgressCallback>,
+    scan_progress_callback: Option<ProgressCallback>,
     abort_flag: Option<Arc<AtomicBool>>,
 }
 
@@ -132,6 +133,7 @@ impl ZsyncAssembly {
             file: None,
             range_gap_threshold: DEFAULT_RANGE_GAP_THRESHOLD,
             progress_callback: None,
+            scan_progress_callback: None,
             abort_flag: None,
         })
     }
@@ -188,12 +190,26 @@ impl ZsyncAssembly {
     /// It receives the values [`Self::progress`] returns at that point, and
     /// runs on the thread calling [`Self::download_missing_blocks`], so a slow
     /// callback slows the download. Blocks found in local files do not
-    /// trigger it.
+    /// trigger it; [`Self::set_scan_progress_callback`] covers those scans.
     pub fn set_progress_callback<F>(&mut self, callback: F)
     where
         F: Fn(u64, u64) + Send + Sync + 'static,
     {
         self.progress_callback = Some(Box::new(callback));
+    }
+
+    /// Sets a callback to run as a scan works through a file.
+    ///
+    /// It receives the bytes scanned so far and the size of the file being
+    /// scanned, once per chunk of about 1 MiB, and last with both equal. Both
+    /// [`Self::submit_source_file`] and [`Self::submit_self_referential`]
+    /// report through it, on the calling thread. A file too small to hold a
+    /// match is not scanned and reports nothing.
+    pub fn set_scan_progress_callback<F>(&mut self, callback: F)
+    where
+        F: Fn(u64, u64) + Send + Sync + 'static,
+    {
+        self.scan_progress_callback = Some(Box::new(callback));
     }
 
     fn report_progress(&self) {
@@ -329,6 +345,9 @@ impl ZsyncAssembly {
 
             total_matched += matched_blocks.len();
             file_offset += bytes_read;
+            if let Some(cb) = &self.scan_progress_callback {
+                cb(file_offset as u64, file_size as u64);
+            }
 
             if bytes_read < read_len {
                 break;
@@ -438,6 +457,9 @@ impl ZsyncAssembly {
 
             total_matched += matched_blocks.len();
             file_offset += bytes_read;
+            if let Some(cb) = &self.scan_progress_callback {
+                cb(file_offset as u64, file_size as u64);
+            }
 
             if bytes_read < read_len {
                 break;
@@ -707,6 +729,38 @@ fn resolve_url(base: &str, relative: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_scan_reports_progress_through_the_whole_file() {
+        let dir = std::env::temp_dir().join(format!("zsync-scan-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let data: Vec<u8> = (0..2_500_000u32).map(|i| (i % 251) as u8).collect();
+        let seed = dir.join("seed.bin");
+        std::fs::write(&seed, &data).expect("write seed");
+
+        let control =
+            ControlFile::generate(&mut std::io::Cursor::new(&data), "f", "f", None).expect("gen");
+        let mut assembly = ZsyncAssembly::new(control, &dir.join("out.bin")).expect("assembly");
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&calls);
+        assembly.set_scan_progress_callback(move |done, total| {
+            sink.lock().unwrap().push((done, total));
+        });
+        assembly.submit_source_file(&seed).expect("scan");
+
+        let calls = calls.lock().unwrap();
+        let size = data.len() as u64;
+        assert!(
+            calls.len() > 1,
+            "one report for a multi-chunk file: {calls:?}"
+        );
+        assert!(calls.iter().all(|&(_, total)| total == size));
+        assert!(calls.windows(2).all(|w| w[0].0 < w[1].0), "{calls:?}");
+        assert_eq!(calls.last(), Some(&(size, size)));
+
+        drop(assembly);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn outputs_differing_in_extension_get_their_own_temp_file() {
