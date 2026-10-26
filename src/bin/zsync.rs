@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 use clap::Parser;
 use zsync_rs::ZsyncAssembly;
+use zsync_rs::http::DEFAULT_RANGE_GAP_THRESHOLD;
 
 #[derive(Parser)]
 #[command(name = "zsync")]
@@ -23,7 +24,7 @@ struct Cli {
     input: Vec<PathBuf>,
 
     /// Gap threshold in KiB for merging HTTP range requests
-    #[arg(long, value_name = "KIB", default_value_t = 256)]
+    #[arg(long, value_name = "KIB", default_value_t = DEFAULT_RANGE_GAP_THRESHOLD / 1024)]
     range_gap: u64,
 
     /// Emit newline-delimited JSON progress events on stdout

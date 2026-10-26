@@ -318,8 +318,15 @@ impl HttpClient {
     }
 }
 
-/// Default gap threshold for range merging (256 KiB, same as zsync2).
-pub const DEFAULT_RANGE_GAP_THRESHOLD: u64 = 256 * 1024;
+/// Default gap threshold for range merging, 16 KiB.
+///
+/// Larger gaps save requests but chain together where needed blocks are
+/// interleaved with known ones. On a real update with about half its
+/// blocks reusable, a 256 KiB gap merged the whole file into one range and
+/// fetched twice the bytes needed. At 16 KiB, real updates fetched within
+/// about 2% of the minimum with far fewer requests than merging only
+/// adjacent blocks.
+pub const DEFAULT_RANGE_GAP_THRESHOLD: u64 = 16 * 1024;
 
 /// Merge byte ranges to minimize HTTP requests.
 ///
