@@ -446,7 +446,7 @@ fn a_failed_download_removes_the_temp_file() {
         "last event was not an error: {stdout}"
     );
     assert!(
-        !out_path.with_extension("zsync-tmp").exists(),
+        !dir.join("out.bin.zsync-tmp").exists(),
         "temp file left behind after a failed download"
     );
 
