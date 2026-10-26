@@ -30,6 +30,19 @@ struct TargetBlock {
     checksum: [u8; 16],
 }
 
+/// The contribution of a byte leaving the window to the rolling `b` sum,
+/// which is the byte shifted left by `log2(blocksize)`, modulo 2^16.
+///
+/// A plain `u16` shift overflows once the block size reaches 64 KiB, which
+/// panics in debug builds and wraps the shift amount in release, so the
+/// rolling sum stops matching blocks at unaligned offsets.
+#[inline(always)]
+fn shifted_out(byte: u8, blockshift: u8) -> u16 {
+    u16::from(byte)
+        .checked_shl(u32::from(blockshift))
+        .unwrap_or(0)
+}
+
 /// Read-only scan state shared across threads.
 struct ScanState<'a> {
     targets: &'a [TargetBlock],
@@ -166,7 +179,7 @@ impl ScanState<'_> {
                     r0.a = r0.a.wrapping_add(u16::from(nc)).wrapping_sub(u16::from(oc));
                     r0.b =
                         r0.b.wrapping_add(r0.a)
-                            .wrapping_sub(u16::from(oc) << blockshift);
+                            .wrapping_sub(shifted_out(oc, blockshift));
 
                     if seq_matches > 1 {
                         let nc2 = data[x + blocksize * 2];
@@ -175,7 +188,7 @@ impl ScanState<'_> {
                                 .wrapping_sub(u16::from(nc));
                         r1.b =
                             r1.b.wrapping_add(r1.a)
-                                .wrapping_sub(u16::from(nc) << blockshift);
+                                .wrapping_sub(shifted_out(nc, blockshift));
                     }
 
                     x += 1;
@@ -578,6 +591,31 @@ mod tests {
         let got = matcher.submit_source_data(&padded, 0);
         assert_eq!(got.len(), 3);
         assert!(matcher.is_complete());
+    }
+
+    #[test]
+    fn large_blocks_match_at_unaligned_offsets() {
+        // 64 KiB blocks shift the leaving byte by 16, past the width of the
+        // rolling sum. The seed starts one byte late, so every match needs
+        // the rolling update to be right.
+        let blocksize = 64 * 1024;
+        let data: Vec<u8> = (0..blocksize as u32 * 3)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+        let control = make_control(&data, blocksize);
+        let mut matcher = BlockMatcher::new(&control);
+
+        let mut seed = vec![0xAA];
+        seed.extend_from_slice(&data);
+        seed.resize(seed.len() + blocksize, 0);
+        let found = matcher.submit_source_data(&seed, 0);
+
+        assert_eq!(found.len(), 3, "found {found:?}");
+        assert!(
+            found
+                .iter()
+                .all(|&(id, offset)| offset == id * blocksize + 1)
+        );
     }
 
     #[test]
