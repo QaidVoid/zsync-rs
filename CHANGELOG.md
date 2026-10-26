@@ -1,4 +1,21 @@
 
+## [0.2.2](https://github.com/QaidVoid/zsync-rs/compare/0.2.1...0.2.2) - 2026-10-26
+
+### Added
+
+- *(assembly)* Expose the control file block size - ([580500f](https://github.com/QaidVoid/zsync-rs/commit/580500f04b47eb03c3eb64de308d6d11cc13ed98))
+- *(cli)* Draw progress as a bar on a terminal - ([3f2f466](https://github.com/QaidVoid/zsync-rs/commit/3f2f46673d36f67c371ff3fe219f56d66b01beae))
+- *(cli)* Report download progress and add --json events - ([01c5262](https://github.com/QaidVoid/zsync-rs/commit/01c52621d144eb4937020100f366370c14fdab84))
+
+### Fixed
+
+- *(assembly)* Use portable file I/O to build on non-unix ([#10](https://github.com/QaidVoid/zsync-rs/pull/10)) - ([b768863](https://github.com/QaidVoid/zsync-rs/commit/b768863c3504da2482e22a8d22aad52e2742da13))
+- *(cli)* Remove the temp file when a download fails - ([05f3c32](https://github.com/QaidVoid/zsync-rs/commit/05f3c32a48ec45c4d0dcb802b99550bc15ee023d))
+
+### Other
+
+- Document the public library API - ([3533208](https://github.com/QaidVoid/zsync-rs/commit/3533208ed78fb62b35e4a1a418c134fd1dbec2a0))
+
 ## [0.2.1](https://github.com/QaidVoid/zsync-rs/compare/0.2.0...0.2.1) - 2026-09-13
 
 ### Fixed
