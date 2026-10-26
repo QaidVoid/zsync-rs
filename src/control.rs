@@ -418,7 +418,9 @@ impl ControlFile {
     /// Write the control file to a writer.
     ///
     /// The block records are written at the lengths [`Self::hash_lengths`]
-    /// gives, so a file written here parses back to the same checksums.
+    /// gives, so a file written here parses back to the same checksums. The
+    /// writer is not flushed, so a buffered one must be flushed by the caller
+    /// to see a late write error.
     ///
     /// # Errors
     ///
