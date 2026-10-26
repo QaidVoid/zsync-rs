@@ -46,9 +46,11 @@ zsync https://example.com/file.zsync -o output.bin
 zsync https://example.com/file.zsync --retries 5
 ```
 
-A download that fails on a network or I/O error is retried, waiting 2 s,
-then 4 s, then 8 s, and each retry fetches only the blocks still missing.
-The count starts over whenever a retry makes progress.
+A download that fails on a dropped connection, a timeout, or a busy server
+(408, 429, 500, 502, 503 or 504) is retried, waiting 2 s, then 4 s, then
+8 s, and each retry fetches only the blocks still missing. The count starts
+over whenever a retry makes progress. Errors that would only repeat, such as
+a missing file or a server that ignores `Range`, fail at once.
 
 ### Progress output
 

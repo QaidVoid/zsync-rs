@@ -8,15 +8,25 @@
 use std::io::Read;
 use std::time::Duration;
 
-use crate::control::ControlFile;
+use crate::control::{ControlFile, ParseError};
 
 /// Why a fetch failed.
 #[derive(Debug, thiserror::Error)]
 pub enum HttpError {
-    /// The request failed, the server answered with an unexpected status, or
-    /// a fetched control file did not parse. The message says which.
+    /// The request could not be made or completed, such as when the host
+    /// was unreachable, the connection dropped or TLS failed.
     #[error("HTTP error: {0}")]
-    Http(String),
+    Request(ureq::Error),
+    /// The server answered with a status that does not carry the data.
+    #[error("HTTP error: server answered with status {0}")]
+    Status(u16),
+    /// The server answered a range that does not start at zero with the
+    /// whole file, so it cannot serve partial downloads.
+    #[error("HTTP error: server ignored the Range header, so it cannot serve partial downloads")]
+    RangeIgnored,
+    /// A fetched control file did not parse.
+    #[error("invalid control file: {0}")]
+    InvalidControl(#[from] ParseError),
     /// Reading a response body failed.
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
@@ -26,6 +36,40 @@ pub enum HttpError {
     /// There was no URL to fetch from. Not currently returned by this crate.
     #[error("No URLs available")]
     NoUrls,
+}
+
+impl From<ureq::Error> for HttpError {
+    fn from(e: ureq::Error) -> Self {
+        match e {
+            ureq::Error::StatusCode(status) => Self::Status(status),
+            e => Self::Request(e),
+        }
+    }
+}
+
+impl HttpError {
+    /// Whether the same request might succeed if made again later.
+    ///
+    /// True for a dropped or timed-out connection, an unreachable host, and
+    /// the statuses a busy or restarting server answers with. False for
+    /// anything the server or the request would repeat, such as a missing
+    /// file or a server that ignores `Range`.
+    pub fn is_transient(&self) -> bool {
+        match self {
+            Self::Request(e) => matches!(
+                e,
+                ureq::Error::Io(_)
+                    | ureq::Error::Timeout(_)
+                    | ureq::Error::HostNotFound
+                    | ureq::Error::ConnectionFailed
+            ),
+            Self::Status(status) => matches!(status, 408 | 429 | 500 | 502 | 503 | 504),
+            Self::Io(_) => true,
+            Self::RangeIgnored | Self::InvalidControl(_) | Self::InvalidUrl(_) | Self::NoUrls => {
+                false
+            }
+        }
+    }
 }
 
 /// The body of one range response, capped at the length requested.
@@ -108,18 +152,14 @@ impl HttpClient {
     ///
     /// # Errors
     ///
-    /// Returns [`HttpError::Http`] when the request fails or the response
+    /// Returns [`HttpError::Request`] or [`HttpError::Status`] when the
+    /// request fails, and [`HttpError::InvalidControl`] when the response
     /// does not parse as a control file.
     pub fn fetch_control_file(&self, url: &str) -> Result<ControlFile, HttpError> {
-        let response = self
-            .agent
-            .get(url)
-            .call()
-            .map_err(|e| HttpError::Http(e.to_string()))?;
+        let response = self.agent.get(url).call()?;
 
         let mut reader = response.into_body().into_reader();
-        ControlFile::parse(&mut reader)
-            .map_err(|e| HttpError::Http(format!("invalid control file: {e}")))
+        Ok(ControlFile::parse(&mut reader)?)
     }
 
     /// A reader over `start..=end` of `url`.
@@ -136,9 +176,10 @@ impl HttpClient {
     ///
     /// # Errors
     ///
-    /// Returns [`HttpError::Http`] when the request fails, when the status is
-    /// neither 200 nor 206, or when it is 200 for a range that does not start
-    /// at zero.
+    /// Returns [`HttpError::Request`] when the request fails,
+    /// [`HttpError::Status`] when the status is neither 200 nor 206, and
+    /// [`HttpError::RangeIgnored`] when it is 200 for a range that does not
+    /// start at zero.
     pub fn fetch_range_reader(
         &self,
         url: &str,
@@ -148,24 +189,14 @@ impl HttpClient {
         let range_header = format!("bytes={}-{}", start, end);
         let requested = end.saturating_sub(start).saturating_add(1);
 
-        let response = self
-            .agent
-            .get(url)
-            .header("Range", &range_header)
-            .call()
-            .map_err(|e| HttpError::Http(e.to_string()))?;
+        let response = self.agent.get(url).header("Range", &range_header).call()?;
 
         let status = response.status();
         if status == 200 && start > 0 {
-            return Err(HttpError::Http(
-                "server ignored the Range header, so it cannot serve partial downloads".to_string(),
-            ));
+            return Err(HttpError::RangeIgnored);
         }
         if status != 206 && status != 200 {
-            return Err(HttpError::Http(format!(
-                "Expected 206 Partial Content, got {}",
-                status
-            )));
+            return Err(HttpError::Status(status.as_u16()));
         }
 
         Ok(HttpRangeReader {
@@ -180,7 +211,7 @@ impl HttpClient {
     ///
     /// # Errors
     ///
-    /// Returns [`HttpError::Http`] when the request fails and
+    /// Returns the errors of [`Self::fetch_range_reader`], and
     /// [`HttpError::Io`] when reading the body fails.
     pub fn fetch_range(&self, url: &str, start: u64, end: u64) -> Result<Vec<u8>, HttpError> {
         let mut reader = self.fetch_range_reader(url, start, end)?;
@@ -320,6 +351,56 @@ mod tests {
         format!("http://{}/f", addr)
     }
 
+    /// A server that answers every request with `status` and an empty body.
+    fn status_server(status: &'static str) -> String {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for mut sock in listener.incoming().flatten() {
+                let mut req = [0u8; 1024];
+                let _ = std::io::Read::read(&mut sock, &mut req);
+                let _ = sock.write_all(
+                    format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                        .as_bytes(),
+                );
+            }
+        });
+        format!("http://{}/f", addr)
+    }
+
+    #[test]
+    fn a_missing_file_is_a_permanent_error() {
+        let err = HttpClient::new()
+            .fetch_range(&status_server("404 Not Found"), 1024, 2047)
+            .expect_err("a 404 must fail");
+        assert!(
+            matches!(err, HttpError::Status(404)),
+            "unexpected error: {err}"
+        );
+        assert!(!err.is_transient());
+    }
+
+    #[test]
+    fn a_busy_server_is_a_transient_error() {
+        let err = HttpClient::new()
+            .fetch_range(&status_server("503 Service Unavailable"), 1024, 2047)
+            .expect_err("a 503 must fail");
+        assert!(
+            matches!(err, HttpError::Status(503)),
+            "unexpected error: {err}"
+        );
+        assert!(err.is_transient());
+    }
+
+    #[test]
+    fn a_refused_connection_is_a_transient_error() {
+        let err = HttpClient::new()
+            .fetch_range("http://127.0.0.1:1/f", 0, 1023)
+            .expect_err("nothing listens on port 1");
+        assert!(err.is_transient(), "unexpected error: {err:?}");
+    }
+
     #[test]
     fn a_full_response_to_a_later_range_is_refused() {
         let url = range_ignoring_server(4096);
@@ -335,7 +416,11 @@ mod tests {
         let err = client
             .fetch_range(&url, 2048, 3071)
             .expect_err("a 200 for a later range must be refused");
-        assert!(err.to_string().contains("Range"), "unexpected error: {err}");
+        assert!(
+            matches!(err, HttpError::RangeIgnored),
+            "unexpected error: {err}"
+        );
+        assert!(!err.is_transient());
     }
 
     #[test]

@@ -26,7 +26,8 @@ use std::time::Duration;
 /// `accept` for the life of the test binary.
 ///
 /// The first `drops` responses for the data file stop halfway through the
-/// body and close the connection, as a flaky link does.
+/// body and close the connection, as a flaky link does. Any other path is
+/// answered with 404.
 fn serve(
     body: Vec<u8>,
     control: Vec<u8>,
@@ -61,8 +62,13 @@ fn serve(
                         .to_string();
                     let payload: &[u8] = if path.ends_with(".zsync") {
                         &control
-                    } else {
+                    } else if path == "/file.bin" {
                         &body
+                    } else {
+                        let _ = stream.write_all(
+                            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        );
+                        continue;
                     };
 
                     let mut range: Option<(usize, usize)> = None;
@@ -615,6 +621,39 @@ fn blocks_that_fail_to_verify_are_reported_as_a_mismatch() {
     assert!(
         !dir.join("out.bin.zsync-tmp").exists(),
         "temp file left behind"
+    );
+
+    shutdown.store(true, Ordering::Relaxed);
+    server.join().ok();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_missing_data_file_fails_without_retrying() {
+    let body: Vec<u8> = (0..100_000u32).map(|i| (i % 233) as u8).collect();
+    let dir = temp_dir("missing");
+
+    let probe = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = probe.local_addr().expect("addr");
+    drop(probe);
+    let control = control_bytes(&dir, &body, &format!("http://{addr}/gone.bin"));
+    let (shutdown, server) = serve(body, control, addr, Duration::ZERO, 0);
+
+    let out_path = dir.join("out.bin");
+    let started = std::time::Instant::now();
+    let out = zsync(&[
+        &format!("http://{addr}/file.zsync"),
+        "-o",
+        out_path.to_str().expect("path"),
+    ]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert!(!out.status.success(), "expected failure");
+    assert!(stderr.contains("404"), "unexpected error: {stderr}");
+    assert!(!stderr.contains("retrying"), "a 404 was retried: {stderr}");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "a 404 waited before failing"
     );
 
     shutdown.store(true, Ordering::Relaxed);

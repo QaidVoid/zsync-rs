@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use clap::Parser;
-use zsync_rs::{AssemblyError, ZsyncAssembly};
+use zsync_rs::ZsyncAssembly;
 
 #[derive(Parser)]
 #[command(name = "zsync")]
@@ -30,7 +30,8 @@ struct Cli {
     #[arg(long)]
     json: bool,
 
-    /// Times to retry a failed download, waiting 2 s, then 4 s, and so on
+    /// Times to retry a download that failed on a network error, waiting
+    /// 2 s, then 4 s, and so on
     #[arg(long, value_name = "N", default_value_t = 3)]
     retries: u32,
 }
@@ -477,8 +478,7 @@ fn main() {
                     }
                     known_at_failure = known;
 
-                    let retryable = matches!(e, AssemblyError::Http(_) | AssemblyError::Io(_));
-                    if retryable && failures < cli.retries {
+                    if e.is_transient() && failures < cli.retries {
                         failures += 1;
                         let delay = Duration::from_secs(2u64.saturating_pow(failures).min(60));
                         let msg = format!(

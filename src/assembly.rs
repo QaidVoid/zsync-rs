@@ -20,7 +20,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::checksum::calc_sha1_stream;
 use crate::control::ControlFile;
 use crate::http::{
-    DEFAULT_RANGE_GAP_THRESHOLD, HttpClient, byte_ranges_from_block_ranges, merge_byte_ranges,
+    DEFAULT_RANGE_GAP_THRESHOLD, HttpClient, HttpError, byte_ranges_from_block_ranges,
+    merge_byte_ranges,
 };
 use crate::matcher::BlockMatcher;
 use crate::matcher::MatchError;
@@ -41,7 +42,7 @@ pub enum AssemblyError {
     Io(#[from] std::io::Error),
     /// Fetching the control file or a block range failed.
     #[error(transparent)]
-    Http(#[from] crate::http::HttpError),
+    Http(#[from] HttpError),
     /// The block matcher failed.
     #[error("Matcher error: {0}")]
     Matcher(#[from] MatchError),
@@ -63,6 +64,16 @@ pub enum AssemblyError {
     /// The abort flag was raised during a scan or a download.
     #[error("Aborted")]
     Aborted,
+}
+
+impl AssemblyError {
+    /// Whether retrying the step that failed might succeed.
+    ///
+    /// Only an [`HttpError`] that [`HttpError::is_transient`] accepts
+    /// qualifies. A local IO error, such as a full disk, would fail again.
+    pub fn is_transient(&self) -> bool {
+        matches!(self, Self::Http(e) if e.is_transient())
+    }
 }
 
 /// Reports whether the caller has raised the abort flag.
@@ -573,7 +584,7 @@ impl ZsyncAssembly {
                     return Err(AssemblyError::Aborted);
                 }
 
-                let n = reader.read(&mut read_buf)?;
+                let n = reader.read(&mut read_buf).map_err(HttpError::Io)?;
                 if n == 0 {
                     break;
                 }
@@ -842,8 +853,11 @@ mod tests {
 
     #[test]
     fn a_wrapped_http_error_is_not_prefixed_twice() {
-        let err = AssemblyError::from(crate::http::HttpError::Http("timed out".to_string()));
-        assert_eq!(err.to_string(), "HTTP error: timed out");
+        let err = AssemblyError::from(HttpError::Status(503));
+        assert_eq!(
+            err.to_string(),
+            "HTTP error: server answered with status 503"
+        );
     }
 
     #[test]
