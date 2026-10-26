@@ -1,4 +1,4 @@
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -65,10 +65,16 @@ fn format_pct(done: usize, total: usize) -> String {
 /// unchanged; this is presentation only.
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 
-/// Where progress goes and how often.
+/// Width of the progress bar in characters, excluding the brackets.
+const BAR_WIDTH: usize = 30;
+
+/// Where progress goes and how it is drawn.
 #[derive(Clone, Copy, PartialEq)]
 enum Mode {
-    Human,
+    /// A single bar redrawn in place, for a terminal.
+    Bar,
+    /// One line per update, for stderr redirected to a file or pipe.
+    Lines,
     Json,
 }
 
@@ -83,6 +89,7 @@ struct Reporter {
     started: Instant,
     last_emit: Option<Instant>,
     last_percent: i32,
+    bar_drawn: bool,
     download_finished: bool,
 }
 
@@ -93,6 +100,7 @@ impl Reporter {
             started: Instant::now(),
             last_emit: None,
             last_percent: -1,
+            bar_drawn: false,
             download_finished: false,
         }
     }
@@ -115,7 +123,7 @@ impl Reporter {
 
     /// Emits a download progress event if the throttle allows it.
     ///
-    /// Human mode additionally drops an event that would repeat the previous
+    /// Lines mode additionally drops an event that would repeat the previous
     /// whole percent, so a slow transfer does not print the same line twice.
     fn progress(&mut self, done: u64, total: u64) {
         if self.download_finished {
@@ -129,7 +137,7 @@ impl Reporter {
         }
 
         let percent = whole_percent(done, total);
-        if self.mode == Mode::Human && percent == self.last_percent {
+        if self.mode == Mode::Lines && percent == self.last_percent {
             return;
         }
 
@@ -143,7 +151,8 @@ impl Reporter {
                     "{{\"event\":\"progress\",\"phase\":\"download\",\"done_bytes\":{done},\"total_bytes\":{total},\"elapsed_ms\":{elapsed_ms}}}"
                 ));
             }
-            Mode::Human => {
+            Mode::Bar => self.draw_bar(done, total),
+            Mode::Lines => {
                 eprintln!(
                     "  {} / {} ({percent}%)",
                     format_bytes(done),
@@ -153,11 +162,26 @@ impl Reporter {
         }
     }
 
+    fn draw_bar(&mut self, done: u64, total: u64) {
+        // `\x1b[K` clears what a longer previous draw left past the cursor.
+        eprint!("\r{}\x1b[K", render_bar(done, total));
+        self.bar_drawn = true;
+    }
+
+    /// Moves past a drawn bar so the next message starts on its own line.
+    fn end_bar(&mut self) {
+        if self.bar_drawn {
+            eprintln!();
+            self.bar_drawn = false;
+        }
+    }
+
     /// Emits the terminal download event, bypassing the throttle.
     ///
     /// A consumer must always see the completed count, even when the last
-    /// block lands inside a throttle window. Human mode prints it only when a
-    /// download printed progress and the line would not repeat the last one.
+    /// block lands inside a throttle window. Human modes print it only when a
+    /// download printed progress, and lines mode only when it would not repeat
+    /// the last line.
     fn finish_download(&mut self, done: u64, total: u64) {
         if self.download_finished {
             return;
@@ -171,7 +195,13 @@ impl Reporter {
                     "{{\"event\":\"progress\",\"phase\":\"download\",\"done_bytes\":{done},\"total_bytes\":{total},\"elapsed_ms\":{elapsed_ms},\"final\":true}}"
                 ));
             }
-            Mode::Human => {
+            Mode::Bar => {
+                if self.bar_drawn {
+                    self.draw_bar(done, total);
+                    self.end_bar();
+                }
+            }
+            Mode::Lines => {
                 let percent = whole_percent(done, total);
                 if self.last_emit.is_some() && percent != self.last_percent {
                     eprintln!(
@@ -201,7 +231,8 @@ impl Reporter {
         ));
     }
 
-    fn emit_error(&self, message: &str) {
+    fn emit_error(&mut self, message: &str) {
+        self.end_bar();
         if self.mode != Mode::Json {
             return;
         }
@@ -214,6 +245,18 @@ impl Reporter {
 
 fn whole_percent(done: u64, total: u64) -> i32 {
     done.saturating_mul(100).checked_div(total).unwrap_or(100) as i32
+}
+
+fn render_bar(done: u64, total: u64) -> String {
+    let percent = whole_percent(done, total).clamp(0, 100);
+    let filled = percent as usize * BAR_WIDTH / 100;
+    format!(
+        "  [{}{}] {percent:>3}%  {} / {}",
+        "#".repeat(filled),
+        " ".repeat(BAR_WIDTH - filled),
+        format_bytes(done),
+        format_bytes(total)
+    )
 }
 
 /// Escapes a string for embedding in a JSON string literal.
@@ -239,7 +282,13 @@ fn json_escape(input: &str) -> String {
 
 fn main() {
     let cli = Cli::parse();
-    let mode = if cli.json { Mode::Json } else { Mode::Human };
+    let mode = if cli.json {
+        Mode::Json
+    } else if std::io::stderr().is_terminal() {
+        Mode::Bar
+    } else {
+        Mode::Lines
+    };
 
     let output_path = cli.output.unwrap_or_else(|| {
         PathBuf::from(
@@ -257,7 +306,7 @@ fn main() {
         Ok(a) => a,
         Err(e) => {
             let msg = format!("Error initializing: {e}");
-            if let Ok(r) = reporter.lock() {
+            if let Ok(mut r) = reporter.lock() {
                 r.emit_error(&msg);
             }
             eprintln!("{msg}");
@@ -332,7 +381,7 @@ fn main() {
                 Ok(_) => {}
                 Err(e) => {
                     let msg = format!("Download error: {e}");
-                    if let Ok(r) = reporter.lock() {
+                    if let Ok(mut r) = reporter.lock() {
                         r.emit_error(&msg);
                     }
                     eprintln!("{msg}");
@@ -353,7 +402,7 @@ fn main() {
     eprintln!("Verifying checksum...");
     if let Err(e) = assembly.complete() {
         let msg = format!("Error: {e}");
-        if let Ok(r) = reporter.lock() {
+        if let Ok(mut r) = reporter.lock() {
             r.emit_error(&msg);
         }
         eprintln!("{msg}");
@@ -364,4 +413,34 @@ fn main() {
         r.emit_done(&output_path.display().to_string());
     }
     eprintln!("Done: {}", output_path.display());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bar_fills_in_proportion_to_progress() {
+        assert_eq!(
+            render_bar(0, 1000),
+            format!("  [{}]   0%  0 B / 1000 B", " ".repeat(BAR_WIDTH))
+        );
+        assert_eq!(
+            render_bar(500, 1000),
+            format!(
+                "  [{}{}]  50%  500 B / 1000 B",
+                "#".repeat(BAR_WIDTH / 2),
+                " ".repeat(BAR_WIDTH - BAR_WIDTH / 2)
+            )
+        );
+        assert_eq!(
+            render_bar(1000, 1000),
+            format!("  [{}] 100%  1000 B / 1000 B", "#".repeat(BAR_WIDTH))
+        );
+    }
+
+    #[test]
+    fn bar_treats_an_empty_target_as_complete() {
+        assert!(render_bar(0, 0).contains("100%"));
+    }
 }

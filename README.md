@@ -45,8 +45,16 @@ zsync https://example.com/file.zsync -o output.bin
 
 ### Progress output
 
-The CLI reports progress during the download, throttled to at most one line
-every 100 ms:
+The CLI reports progress during the download, updated at most every 100 ms.
+On a terminal it draws a single bar that redraws in place:
+
+```
+Downloading missing blocks...
+  [#############                 ]  45%  8.62 MB / 19.07 MB
+```
+
+When stderr is redirected to a file or a pipe, it prints one line per update
+instead, skipping updates that would repeat the previous percent:
 
 ```
 Downloading missing blocks...
