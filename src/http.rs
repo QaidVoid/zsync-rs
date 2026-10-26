@@ -77,11 +77,26 @@ impl HttpError {
 /// Returned by [`HttpClient::fetch_range_reader`].
 pub struct HttpRangeReader {
     reader: Box<dyn std::io::Read + Send + Sync>,
+    remaining: u64,
 }
 
 impl std::io::Read for HttpRangeReader {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.reader.read(buf)
+        if self.remaining == 0 {
+            // ureq returns a connection to its pool only once it has seen
+            // the end of the body, so one more read is needed for the next
+            // request to reuse it. A body longer than asked for is not
+            // read further, and its connection is closed instead.
+            let _ = self.reader.read(&mut [0u8; 1]);
+            self.reader = Box::new(std::io::empty());
+            return Ok(0);
+        }
+        let len = buf
+            .len()
+            .min(usize::try_from(self.remaining).unwrap_or(usize::MAX));
+        let n = self.reader.read(&mut buf[..len])?;
+        self.remaining -= n as u64;
+        Ok(n)
     }
 }
 
@@ -159,7 +174,11 @@ impl HttpClient {
         let response = self.agent.get(url).call()?;
 
         let mut reader = response.into_body().into_reader();
-        Ok(ControlFile::parse(&mut reader)?)
+        let control = ControlFile::parse(&mut reader)?;
+        // Reaching the end of the body lets ureq reuse the connection, which
+        // usually goes to the same host as the first range request.
+        let _ = std::io::copy(&mut reader.take(64 * 1024), &mut std::io::sink());
+        Ok(control)
     }
 
     /// A reader over `start..=end` of `url`.
@@ -200,7 +219,8 @@ impl HttpClient {
         }
 
         Ok(HttpRangeReader {
-            reader: Box::new(response.into_body().into_reader().take(requested)),
+            reader: Box::new(response.into_body().into_reader()),
+            remaining: requested,
         })
     }
 
@@ -399,6 +419,73 @@ mod tests {
             .fetch_range("http://127.0.0.1:1/f", 0, 1023)
             .expect_err("nothing listens on port 1");
         assert!(err.is_transient(), "unexpected error: {err:?}");
+    }
+
+    /// A keep-alive server that answers every range request with `206` and
+    /// as many zero bytes as asked for, counting the connections it accepts.
+    fn keep_alive_server() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{BufRead, Write};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let connections = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = connections.clone();
+        std::thread::spawn(move || {
+            for sock in listener.incoming().flatten() {
+                counter.fetch_add(1, Ordering::SeqCst);
+                std::thread::spawn(move || {
+                    let mut reader = std::io::BufReader::new(sock.try_clone().unwrap());
+                    let mut sock = sock;
+                    loop {
+                        let mut range = (0u64, 0u64);
+                        loop {
+                            let mut line = String::new();
+                            if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                                return;
+                            }
+                            if line == "\r\n" {
+                                break;
+                            }
+                            if let Some(spec) =
+                                line.to_ascii_lowercase().strip_prefix("range: bytes=")
+                            {
+                                let (a, b) = spec.trim().split_once('-').unwrap();
+                                range = (a.parse().unwrap(), b.parse().unwrap());
+                            }
+                        }
+                        let len = range.1 - range.0 + 1;
+                        let head = format!(
+                            "HTTP/1.1 206 Partial Content\r\nContent-Length: {len}\r\nContent-Range: bytes {}-{}/1048576\r\n\r\n",
+                            range.0, range.1
+                        );
+                        if sock.write_all(head.as_bytes()).is_err()
+                            || sock.write_all(&vec![0u8; len as usize]).is_err()
+                        {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (format!("http://{addr}/f"), connections)
+    }
+
+    #[test]
+    fn consecutive_range_requests_share_one_connection() {
+        let (url, connections) = keep_alive_server();
+        let client = HttpClient::new();
+        for i in 0..5 {
+            let start = i * 4096;
+            let data = client
+                .fetch_range(&url, start, start + 4095)
+                .expect("fetch");
+            assert_eq!(data.len(), 4096);
+        }
+        assert_eq!(
+            connections.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "each range request opened its own connection"
+        );
     }
 
     #[test]
