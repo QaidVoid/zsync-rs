@@ -22,7 +22,7 @@ struct Cli {
     #[arg(short = 'i', long, value_name = "FILE")]
     input: Vec<PathBuf>,
 
-    /// Gap threshold in KiB for merging HTTP range requests (default: 256)
+    /// Gap threshold in KiB for merging HTTP range requests
     #[arg(long, value_name = "KIB", default_value_t = 256)]
     range_gap: u64,
 
@@ -410,8 +410,9 @@ fn main() {
         }
     }
 
-    // Self-referential scan: the temp file may contain duplicate target blocks
-    if !cli.input.is_empty() && !assembly.is_complete() {
+    // Self-referential scan: the temp file may contain duplicate target
+    // blocks. It holds nothing until a seed has matched a block.
+    if assembly.block_stats().0 > 0 && !assembly.is_complete() {
         eprintln!("Scanning for repeated blocks...");
         if let Ok(mut r) = reporter.lock() {
             r.begin("self_scan", None);
