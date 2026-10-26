@@ -24,11 +24,15 @@ use std::time::Duration;
 /// The listener is non-blocking and polls a shutdown flag, so a test can
 /// stop the server and join its thread instead of leaving it blocked in
 /// `accept` for the life of the test binary.
+///
+/// The first `drops` responses for the data file stop halfway through the
+/// body and close the connection, as a flaky link does.
 fn serve(
     body: Vec<u8>,
     control: Vec<u8>,
     addr: SocketAddr,
     chunk_delay: Duration,
+    mut drops: usize,
 ) -> (Arc<AtomicBool>, thread::JoinHandle<()>) {
     let listener = TcpListener::bind(addr).expect("rebind");
     listener
@@ -87,6 +91,12 @@ fn serve(
 
                     let (start, end) = range.unwrap_or((0, payload.len() - 1));
                     let slice = &payload[start..=end];
+                    let sent = if drops > 0 && !path.ends_with(".zsync") {
+                        drops -= 1;
+                        slice.len() / 2
+                    } else {
+                        slice.len()
+                    };
                     let header = if range.is_some() {
                         format!(
                             "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {start}-{end}/{}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
@@ -107,7 +117,7 @@ fn serve(
                     // callback still pass, because the forced final event
                     // does not depend on the callback firing at all.
                     const CHUNK: usize = 32 * 1024;
-                    for part in slice.chunks(CHUNK) {
+                    for part in slice[..sent].chunks(CHUNK) {
                         if stream.write_all(part).is_err() {
                             break;
                         }
@@ -151,6 +161,15 @@ fn control_bytes(dir: &Path, body: &[u8], data_url: &str) -> Vec<u8> {
 /// binding, so a probe bind picks the port first and the real listener takes
 /// it back once the control file names it.
 fn origin(dir: &Path, body: &[u8]) -> (String, Arc<AtomicBool>, thread::JoinHandle<()>) {
+    flaky_origin(dir, body, 0)
+}
+
+/// An [`origin`] whose first `drops` data responses are cut off halfway.
+fn flaky_origin(
+    dir: &Path,
+    body: &[u8],
+    drops: usize,
+) -> (String, Arc<AtomicBool>, thread::JoinHandle<()>) {
     let probe = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = probe.local_addr().expect("addr");
     drop(probe);
@@ -161,7 +180,13 @@ fn origin(dir: &Path, body: &[u8]) -> (String, Arc<AtomicBool>, thread::JoinHand
 
     // ~20 chunks at 25 ms keeps a transfer near half a second, which is
     // several 100 ms throttle windows.
-    let (shutdown, handle) = serve(body.to_vec(), control, addr, Duration::from_millis(25));
+    let (shutdown, handle) = serve(
+        body.to_vec(),
+        control,
+        addr,
+        Duration::from_millis(25),
+        drops,
+    );
     (control_url, shutdown, handle)
 }
 
@@ -427,7 +452,7 @@ fn a_failed_download_removes_the_temp_file() {
     let addr = probe.local_addr().expect("addr");
     drop(probe);
     let control = control_bytes(&dir, &body, "http://127.0.0.1:1/file.bin");
-    let (shutdown, server) = serve(body.clone(), control, addr, Duration::ZERO);
+    let (shutdown, server) = serve(body.clone(), control, addr, Duration::ZERO, 0);
 
     let seed = dir.join("seed.bin");
     std::fs::write(&seed, &body[..100_000]).expect("write seed");
@@ -439,6 +464,9 @@ fn a_failed_download_removes_the_temp_file() {
         "-o",
         out_path.to_str().expect("path"),
         "--json",
+        // The data port is closed, so retrying would only add waits.
+        "--retries",
+        "0",
     ]);
     let stdout = String::from_utf8_lossy(&out.stdout);
 
@@ -519,6 +547,39 @@ fn json_mode_reports_seed_scan_progress_before_the_download() {
             && last_scan.contains(&format!("\"done_bytes\":{len}")),
         "the scan must end with the whole seed: {last_scan}"
     );
+
+    shutdown.store(true, Ordering::Relaxed);
+    server.join().ok();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_dropped_connection_is_retried_and_the_download_completes() {
+    let body: Vec<u8> = (0..300_000u32).map(|i| (i % 239) as u8).collect();
+    let dir = temp_dir("retry");
+    let (control_url, shutdown, server) = flaky_origin(&dir, &body, 1);
+
+    let out_path = dir.join("out.bin");
+    let out = zsync(&[
+        &control_url,
+        "-o",
+        out_path.to_str().expect("path"),
+        "--json",
+    ]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert!(out.status.success(), "zsync failed: {stderr}");
+    assert_eq!(std::fs::read(&out_path).expect("read output"), body);
+    let retry = stdout
+        .lines()
+        .find(|l| l.contains("\"event\":\"retry\""))
+        .unwrap_or_else(|| panic!("no retry event: {stdout}"));
+    assert!(
+        retry.contains("\"attempt\":1") && retry.contains("\"delay_ms\":2000"),
+        "{retry}"
+    );
+    assert!(stderr.contains("retrying in 2 s"), "{stderr}");
 
     shutdown.store(true, Ordering::Relaxed);
     server.join().ok();

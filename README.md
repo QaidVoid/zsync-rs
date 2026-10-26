@@ -41,7 +41,14 @@ zsync https://example.com/v3.0/app.zsync -i app-v2.9.AppImage -i app-v2.8.AppIma
 
 # Specify output filename
 zsync https://example.com/file.zsync -o output.bin
+
+# Retry a dropped download up to 5 times instead of the default 3
+zsync https://example.com/file.zsync --retries 5
 ```
+
+A download that fails on a network or I/O error is retried, waiting 2 s,
+then 4 s, then 8 s, and each retry fetches only the blocks still missing.
+The count starts over whenever a retry makes progress.
 
 ### Progress output
 
@@ -90,7 +97,9 @@ nothing but JSON:
 ```
 
 Every line is one JSON object with an `event` field. The events are `start`,
-`progress`, `phase`, `done`, and `error`. A `progress` event's `phase` is
+`progress`, `phase`, `retry`, `done`, and `error`. A `retry` event carries
+the `attempt` number, the `retries` allowed, the `delay_ms` before it, and
+the error `message`. A `progress` event's `phase` is
 `scan` for a seed file, which it names in `file`, `self_scan` for the rescan
 of the assembled data, or `download`. In a scan, the byte counts are of the
 file being scanned; in the download, they are of the target. Each phase ends

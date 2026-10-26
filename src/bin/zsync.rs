@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use clap::Parser;
-use zsync_rs::ZsyncAssembly;
+use zsync_rs::{AssemblyError, ZsyncAssembly};
 
 #[derive(Parser)]
 #[command(name = "zsync")]
@@ -29,6 +29,10 @@ struct Cli {
     /// Emit newline-delimited JSON progress events on stdout
     #[arg(long)]
     json: bool,
+
+    /// Times to retry a failed download, waiting 2 s, then 4 s, and so on
+    #[arg(long, value_name = "N", default_value_t = 3)]
+    retries: u32,
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -259,6 +263,18 @@ impl Reporter {
         ));
     }
 
+    fn emit_retry(&mut self, attempt: u32, retries: u32, delay: Duration, message: &str) {
+        self.end_bar();
+        if self.mode != Mode::Json {
+            return;
+        }
+        self.write_line(&format!(
+            "{{\"event\":\"retry\",\"attempt\":{attempt},\"retries\":{retries},\"delay_ms\":{},\"message\":\"{}\"}}",
+            delay.as_millis(),
+            json_escape(message)
+        ));
+    }
+
     fn emit_error(&mut self, message: &str) {
         self.end_bar();
         if self.mode != Mode::Json {
@@ -444,11 +460,39 @@ fn main() {
             }
         });
 
+        // Blocks already written stay known, so a retry fetches only what is
+        // still missing. The count resets whenever an attempt made progress,
+        // so a long download on a flaky link is not capped at a few drops.
+        let mut failures = 0;
+        let mut known_at_failure = assembly.block_stats().0;
         loop {
             match assembly.download_missing_blocks() {
                 Ok(0) => break,
                 Ok(_) => {}
                 Err(e) => {
+                    let known = assembly.block_stats().0;
+                    if known > known_at_failure {
+                        failures = 0;
+                    }
+                    known_at_failure = known;
+
+                    let retryable = matches!(e, AssemblyError::Http(_) | AssemblyError::Io(_));
+                    if retryable && failures < cli.retries {
+                        failures += 1;
+                        let delay = Duration::from_secs(2u64.saturating_pow(failures).min(60));
+                        let msg = format!(
+                            "Download error: {e}; retrying in {} s ({failures}/{})",
+                            delay.as_secs(),
+                            cli.retries
+                        );
+                        if let Ok(mut r) = reporter.lock() {
+                            r.emit_retry(failures, cli.retries, delay, &msg);
+                        }
+                        eprintln!("{msg}");
+                        std::thread::sleep(delay);
+                        continue;
+                    }
+
                     let msg = format!("Download error: {e}");
                     if let Ok(mut r) = reporter.lock() {
                         r.emit_error(&msg);
