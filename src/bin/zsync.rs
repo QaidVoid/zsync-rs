@@ -125,6 +125,8 @@ fn main() {
                 }
                 Err(e) => {
                     eprintln!("Download error: {e}");
+                    // `exit` skips destructors, and dropping removes the temp file.
+                    drop(assembly);
                     std::process::exit(1);
                 }
             }
