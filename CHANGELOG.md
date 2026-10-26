@@ -1,4 +1,30 @@
 
+## [0.3.0](https://github.com/QaidVoid/zsync-rs/compare/0.2.2...0.3.0) - 2026-10-26
+
+### Added
+
+- *(cli)* Retry a failed download with growing waits - ([773ef3d](https://github.com/QaidVoid/zsync-rs/commit/773ef3da387a7ce0a75608b46add88ee290d5a69))
+- Report progress while scanning seed files - ([bb27967](https://github.com/QaidVoid/zsync-rs/commit/bb27967c233bf0019baf5a8a5faa39fa21f19cc7))
+
+### Fixed
+
+- *(assembly)* Ignore the query when resolving relative URLs - ([622f7d4](https://github.com/QaidVoid/zsync-rs/commit/622f7d4ef6fdd2948f47773d424663be282e681c))
+- *(assembly)* Flush the output to disk before renaming it - ([8607324](https://github.com/QaidVoid/zsync-rs/commit/8607324c66fce8202841520674a2c0fe7a12a82d))
+- *(assembly)* Keep the replaced file's permissions - ([39672d8](https://github.com/QaidVoid/zsync-rs/commit/39672d8c4febaa73ff8a3c8ad8817be8b743cddc))
+- *(cli)* Skip an empty rescan and show the --range-gap default once - ([8cb386f](https://github.com/QaidVoid/zsync-rs/commit/8cb386f438a5b5161c831d6bc9b3d36153fe2a2d))
+- *(http)* Reuse connections across range requests - ([71bb439](https://github.com/QaidVoid/zsync-rs/commit/71bb43998befb5d43ce8ee91d5f69bf0daa3cc43))
+- *(matcher)* Report only blocks a scan newly finds - ([8d83339](https://github.com/QaidVoid/zsync-rs/commit/8d833398d9e1033f2b7f64a2e22770f338f3ccf1))
+- Retry only downloads that failed on a transient error - ([ec627e5](https://github.com/QaidVoid/zsync-rs/commit/ec627e51466cbdc8e725102920615512ce645160))
+- Say blocks failed to verify instead of that they are missing - ([b944b3b](https://github.com/QaidVoid/zsync-rs/commit/b944b3bdcd9ec3aead4962639106922c7a8d6374))
+- Make progress linear and harden block size and range handling ([#14](https://github.com/QaidVoid/zsync-rs/pull/14)) - ([6bbb4dd](https://github.com/QaidVoid/zsync-rs/commit/6bbb4dd263e697501677b403998e187cdc5aee88))
+
+### Other
+
+- *(deps)* Upgrade dependencies - ([6ca48ec](https://github.com/QaidVoid/zsync-rs/commit/6ca48ec89b805bfd08a0c7f2573e6f901a549765))
+- *(http)* Follow a range URL's redirect only once - ([b2a6b94](https://github.com/QaidVoid/zsync-rs/commit/b2a6b940f0bdb4b0b6546b2a162aaec1a2b5cc50))
+- Lower the default range gap to 16 KiB - ([f2fd34b](https://github.com/QaidVoid/zsync-rs/commit/f2fd34bb14749b24c0943ef8593c420adeb14912))
+- Scan seed files across all cores - ([51d6f0e](https://github.com/QaidVoid/zsync-rs/commit/51d6f0e560f21847f4995c2a0c133f95e5a8de4b))
+
 ## [0.2.2](https://github.com/QaidVoid/zsync-rs/compare/0.2.1...0.2.2) - 2026-10-26
 
 ### Added
