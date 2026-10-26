@@ -1,4 +1,10 @@
 
+## [0.3.1](https://github.com/QaidVoid/zsync-rs/compare/0.3.0...0.3.1) - 2026-10-26
+
+### Fixed
+
+- *(matcher)* Fill every copy of a block the target repeats - ([a652113](https://github.com/QaidVoid/zsync-rs/commit/a652113563279459c30651b13d4b302cdd22e1b3))
+
 ## [0.3.0](https://github.com/QaidVoid/zsync-rs/compare/0.2.2...0.3.0) - 2026-10-26
 
 ### Added
