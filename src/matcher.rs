@@ -3,7 +3,9 @@
 //! [`BlockMatcher`] indexes the target's block checksums and then tests every
 //! byte offset of the data it is given. The rolling checksum slides along one
 //! byte at a time, a bit filter and a hash table reject most offsets without
-//! a lookup, and MD4 confirms what survives. With
+//! a lookup, and MD4 confirms what survives. Data that matches is used for
+//! every block with the same checksums, so a block the target repeats is
+//! filled everywhere from one copy. With
 //! [`HashLengths::seq_matches`] of 2, a match that does not continue the
 //! previous one counts only when the block after it matches too, which keeps
 //! short rolling checksums from producing false matches. On a machine with
@@ -76,6 +78,80 @@ impl ScanState<'_> {
         target.a == (rolling.a & self.rsum_a_mask) && target.b == rolling.b
     }
 
+    /// Tests every target block hashed like the window at `x` and records
+    /// each one that matches.
+    ///
+    /// Every block that passes is recorded, not just the first, so data that
+    /// a target repeats fills each copy from one sighting. Each block is held
+    /// to the same test as a lone match, including the following block's
+    /// check when `seq_matches` is 2. `matched` names a block the caller
+    /// has already matched here, which is skipped, and `checksum` is the
+    /// window's MD4 when the caller already has it.
+    ///
+    /// Returns how many blocks the first match covers and the block expected
+    /// to follow it, or `None` when nothing matched.
+    #[inline(always)]
+    fn match_chain(
+        &self,
+        data: &[u8],
+        x: usize,
+        (r0, r1): (&Rsum, &Rsum),
+        base_offset: usize,
+        (matched, mut checksum): (Option<usize>, Option<[u8; 16]>),
+        matched_blocks: &mut Vec<(usize, usize)>,
+    ) -> Option<(usize, Option<usize>)> {
+        let blocksize = self.blocksize;
+        let checksum_bytes = self.checksum_bytes;
+        let hash = self.calc_hash_rolling(r0, r1);
+        let bh = (hash & self.bithash_mask) as usize;
+        if self.bithash[bh >> 3] & (1 << (bh & 7)) == 0 {
+            return None;
+        }
+
+        let mut first = None;
+        let mut next_checksum = None;
+        let mut block_idx = self.hash_table[(hash & self.hash_mask) as usize];
+        while block_idx != HASH_EMPTY {
+            let block_id = block_idx as usize;
+            block_idx = self.hash_next[block_id];
+
+            let target = &self.targets[block_id];
+            if matched == Some(block_id) || !self.rsum_match(&target.rsum, r0) {
+                continue;
+            }
+
+            if self.seq_matches > 1 && block_id + 1 < self.targets.len() {
+                let next_target = &self.targets[block_id + 1];
+                if !self.rsum_match(&next_target.rsum, r1) {
+                    continue;
+                }
+
+                let sum = checksum.get_or_insert_with(|| calc_md4(&data[x..x + blocksize]));
+                if sum[..checksum_bytes] != target.checksum[..checksum_bytes] {
+                    continue;
+                }
+
+                let next_sum = next_checksum
+                    .get_or_insert_with(|| calc_md4(&data[x + blocksize..x + blocksize * 2]));
+                if next_sum[..checksum_bytes] == next_target.checksum[..checksum_bytes] {
+                    matched_blocks.push((block_id, base_offset + x));
+                    matched_blocks.push((block_id + 1, base_offset + x + blocksize));
+                    first.get_or_insert((
+                        self.seq_matches,
+                        (block_id + 2 < self.targets.len()).then_some(block_id + 2),
+                    ));
+                }
+            } else {
+                let sum = checksum.get_or_insert_with(|| calc_md4(&data[x..x + blocksize]));
+                if sum[..checksum_bytes] == target.checksum[..checksum_bytes] {
+                    matched_blocks.push((block_id, base_offset + x));
+                    first.get_or_insert((1, None));
+                }
+            }
+        }
+        first
+    }
+
     /// Scan a chunk of data for matching blocks. Pure read-only, no mutations.
     /// `base_offset` is the absolute byte offset of `data[0]` within the source file.
     /// Returns vec of (target_block_id, absolute_source_offset).
@@ -118,59 +194,31 @@ impl ScanState<'_> {
                         if hint_id + 1 < self.targets.len() {
                             next_match_id = Some(hint_id + 1);
                         }
+                        // The hint continues one copy of repeated data, and
+                        // the chain holds the others.
+                        self.match_chain(
+                            data,
+                            x,
+                            (&r0, &r1),
+                            base_offset,
+                            (Some(hint_id), Some(checksum)),
+                            &mut matched_blocks,
+                        );
                     }
                 }
             }
 
             while blocks_matched == 0 && x < x_limit {
-                let hash = self.calc_hash_rolling(&r0, &r1);
-
-                let bh = (hash & self.bithash_mask) as usize;
-                if self.bithash[bh >> 3] & (1 << (bh & 7)) != 0 {
-                    let mut block_idx = self.hash_table[(hash & self.hash_mask) as usize];
-
-                    while block_idx != HASH_EMPTY {
-                        let block_id = block_idx as usize;
-                        block_idx = self.hash_next[block_id];
-
-                        let target = &self.targets[block_id];
-                        if !self.rsum_match(&target.rsum, &r0) {
-                            continue;
-                        }
-
-                        if seq_matches > 1 && block_id + 1 < self.targets.len() {
-                            let next_target = &self.targets[block_id + 1];
-                            if !self.rsum_match(&next_target.rsum, &r1) {
-                                continue;
-                            }
-
-                            let checksum = calc_md4(&data[x..x + blocksize]);
-                            if checksum[..checksum_bytes] != target.checksum[..checksum_bytes] {
-                                continue;
-                            }
-
-                            let next_checksum = calc_md4(&data[x + blocksize..x + blocksize * 2]);
-                            if next_checksum[..checksum_bytes]
-                                == next_target.checksum[..checksum_bytes]
-                            {
-                                matched_blocks.push((block_id, base_offset + x));
-                                matched_blocks.push((block_id + 1, base_offset + x + blocksize));
-                                blocks_matched = seq_matches;
-
-                                if block_id + 2 < self.targets.len() {
-                                    next_match_id = Some(block_id + 2);
-                                }
-                                break;
-                            }
-                        } else {
-                            let checksum = calc_md4(&data[x..x + blocksize]);
-                            if checksum[..checksum_bytes] == target.checksum[..checksum_bytes] {
-                                matched_blocks.push((block_id, base_offset + x));
-                                blocks_matched = 1;
-                                break;
-                            }
-                        }
-                    }
+                if let Some((matched, next)) = self.match_chain(
+                    data,
+                    x,
+                    (&r0, &r1),
+                    base_offset,
+                    (None, None),
+                    &mut matched_blocks,
+                ) {
+                    blocks_matched = matched;
+                    next_match_id = next;
                 }
 
                 if blocks_matched == 0 {
@@ -637,6 +685,44 @@ mod tests {
         assert_eq!(found, vec![(0, 0)], "only the newly found block counts");
         assert_eq!(matcher.blocks_todo(), 2);
         assert!(!matcher.is_complete());
+    }
+
+    #[test]
+    fn data_the_target_repeats_fills_every_copy() {
+        let blocksize = 256;
+        let random = |seed: u32, len: usize| -> Vec<u8> {
+            let mut x = seed;
+            (0..len)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 17;
+                    x ^= x << 5;
+                    x as u8
+                })
+                .collect()
+        };
+        let (head, chunk, tail) = (random(1, 4096), random(2, 8 * blocksize), random(3, 4096));
+
+        let mut target = head.clone();
+        for _ in 0..8 {
+            target.extend_from_slice(&chunk);
+        }
+        target.extend_from_slice(&tail);
+
+        // The seed holds the chunk once, but every copy in the target is the
+        // same data, so one sighting is enough for all of them.
+        let mut seed = [head, chunk, tail].concat();
+        let mut control = make_control(&target, blocksize);
+        control.hash_lengths.seq_matches = 2;
+        let mut matcher = BlockMatcher::new(&control);
+        seed.resize(seed.len() + 2 * blocksize, 0);
+        matcher.submit_source_data(&seed, 0);
+
+        assert!(
+            matcher.is_complete(),
+            "repeated blocks were left to download: {:?}",
+            matcher.needed_block_ranges()
+        );
     }
 
     #[test]
