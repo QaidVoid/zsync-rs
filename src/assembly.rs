@@ -718,9 +718,14 @@ fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
+/// The directory of `url`, against which relative URLs resolve.
+///
+/// The query and fragment are dropped first, because a signed URL's query can
+/// itself contain `/`.
 fn extract_base_url(url: &str) -> String {
-    url.rfind('/')
-        .map(|i| url[..=i].to_string())
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    path.rfind('/')
+        .map(|i| path[..=i].to_string())
         .unwrap_or_default()
 }
 
@@ -853,6 +858,14 @@ mod tests {
         assert_eq!(
             extract_base_url("https://example.com/file.zsync"),
             "https://example.com/"
+        );
+        assert_eq!(
+            extract_base_url("https://example.com/a/file.zsync?sig=ab/cd&e=1"),
+            "https://example.com/a/"
+        );
+        assert_eq!(
+            extract_base_url("https://example.com/a/file.zsync#x/y"),
+            "https://example.com/a/"
         );
     }
 
