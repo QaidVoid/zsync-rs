@@ -642,7 +642,8 @@ impl ZsyncAssembly {
     ///
     /// The temporary file is cut to the target's length, its SHA-1 is
     /// compared with the control file's when the control file has one, and
-    /// it is renamed to the output path. On any error the assembly is
+    /// it is renamed to the output path. A file already at the output path
+    /// is replaced, and its permissions carry over to the new one. On any error the assembly is
     /// dropped, which removes the temporary file.
     ///
     /// # Errors
@@ -677,6 +678,11 @@ impl ZsyncAssembly {
         }
 
         self.file.take();
+        // Replacing an existing file, such as an executable AppImage updated
+        // in place, keeps its permissions rather than the temp file's.
+        if let Ok(existing) = std::fs::metadata(&self.output_path) {
+            std::fs::set_permissions(&self.temp_path, existing.permissions())?;
+        }
         std::fs::rename(&self.temp_path, &self.output_path)?;
 
         Ok(())
@@ -759,6 +765,33 @@ mod tests {
         assert_eq!(calls.last(), Some(&(size, size)));
 
         drop(assembly);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacing_an_executable_keeps_it_executable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("zsync-perms-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let data: Vec<u8> = (0..10_000u32).map(|i| (i % 253) as u8).collect();
+        let seed = dir.join("new.bin");
+        std::fs::write(&seed, &data).expect("write seed");
+        let out = dir.join("app.AppImage");
+        std::fs::write(&out, b"old version").expect("write old");
+        std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        let control =
+            ControlFile::generate(&mut std::io::Cursor::new(&data), "f", "f", None).expect("gen");
+        let mut assembly = ZsyncAssembly::new(control, &out).expect("assembly");
+        assembly.submit_source_file(&seed).expect("scan");
+        assembly.complete().expect("complete");
+
+        assert_eq!(std::fs::read(&out).expect("read"), data);
+        let mode = std::fs::metadata(&out).expect("stat").permissions().mode();
+        assert_eq!(mode & 0o777, 0o755, "mode {mode:o}");
+
         std::fs::remove_dir_all(&dir).ok();
     }
 
