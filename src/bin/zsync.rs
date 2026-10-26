@@ -506,6 +506,23 @@ fn main() {
         }
     }
 
+    // Downloading stops once a pass adds nothing, so blocks still missing
+    // here arrived but did not match their checksums.
+    if !assembly.is_complete() {
+        let (known, total) = assembly.block_stats();
+        let msg = format!(
+            "Download error: {} of {total} blocks from the server did not match the control file, \
+             so it may be serving a different version of the file",
+            total - known
+        );
+        if let Ok(mut r) = reporter.lock() {
+            r.emit_error(&msg);
+        }
+        eprintln!("{msg}");
+        drop(assembly);
+        std::process::exit(1);
+    }
+
     if let Ok(mut r) = reporter.lock() {
         let (done, total) = assembly.progress();
         r.finish(done, total);

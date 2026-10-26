@@ -660,9 +660,11 @@ impl ZsyncAssembly {
     /// fails.
     pub fn complete(mut self) -> Result<(), AssemblyError> {
         if !self.matcher.is_complete() {
-            return Err(AssemblyError::Control(
-                "Not all blocks downloaded".to_string(),
-            ));
+            let (known, total) = self.block_stats();
+            return Err(AssemblyError::Control(format!(
+                "{} of {total} blocks are still missing",
+                total - known
+            )));
         }
 
         let file_length = self.control.length;

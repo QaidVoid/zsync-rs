@@ -585,3 +585,39 @@ fn a_dropped_connection_is_retried_and_the_download_completes() {
     server.join().ok();
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn blocks_that_fail_to_verify_are_reported_as_a_mismatch() {
+    let body: Vec<u8> = (0..100_000u32).map(|i| (i % 233) as u8).collect();
+    let other: Vec<u8> = body.iter().map(|b| b ^ 0x5A).collect();
+    let dir = temp_dir("mismatch");
+
+    // The control file describes `body`, but the origin serves `other`.
+    let probe = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = probe.local_addr().expect("addr");
+    drop(probe);
+    let control = control_bytes(&dir, &body, &format!("http://{addr}/file.bin"));
+    let (shutdown, server) = serve(other, control, addr, Duration::ZERO, 0);
+
+    let out_path = dir.join("out.bin");
+    let out = zsync(&[
+        &format!("http://{addr}/file.zsync"),
+        "-o",
+        out_path.to_str().expect("path"),
+    ]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert!(!out.status.success(), "expected failure");
+    assert!(
+        stderr.contains("did not match the control file"),
+        "unexpected error: {stderr}"
+    );
+    assert!(
+        !dir.join("out.bin.zsync-tmp").exists(),
+        "temp file left behind"
+    );
+
+    shutdown.store(true, Ordering::Relaxed);
+    server.join().ok();
+    std::fs::remove_dir_all(&dir).ok();
+}
