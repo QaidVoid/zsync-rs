@@ -217,6 +217,9 @@ pub struct BlockMatcher {
     hash_func_shift: u32,
     targets: Vec<TargetBlock>,
     known_blocks: Vec<bool>,
+    /// How many entries of `known_blocks` are set, kept so that progress
+    /// queries after every downloaded block do not rescan the whole vector.
+    known_count: usize,
     hash_table: Vec<u32>,
     hash_next: Vec<u32>,
     hash_mask: u32,
@@ -286,6 +289,7 @@ impl BlockMatcher {
             hash_func_shift,
             targets,
             known_blocks: vec![false; num_blocks],
+            known_count: 0,
             hash_table: vec![HASH_EMPTY; (hash_mask + 1) as usize],
             hash_next: vec![HASH_EMPTY; num_blocks],
             hash_mask,
@@ -341,6 +345,13 @@ impl BlockMatcher {
         }
     }
 
+    fn mark_known(&mut self, block_id: usize) {
+        if !self.known_blocks[block_id] {
+            self.known_blocks[block_id] = true;
+            self.known_count += 1;
+        }
+    }
+
     fn scan_state(&self) -> ScanState<'_> {
         ScanState {
             targets: &self.targets,
@@ -385,7 +396,7 @@ impl BlockMatcher {
 
             let checksum = calc_md4(block_data);
             if checksum[..checksum_bytes] == self.targets[block_id].checksum[..checksum_bytes] {
-                self.known_blocks[block_id] = true;
+                self.mark_known(block_id);
             } else {
                 return Ok(false);
             }
@@ -456,7 +467,7 @@ impl BlockMatcher {
         for (block_id, offset) in candidates {
             if !seen[block_id] {
                 seen[block_id] = true;
-                self.known_blocks[block_id] = true;
+                self.mark_known(block_id);
                 self.remove_block_from_hash(block_id);
                 matched_blocks.push((block_id, offset));
             }
@@ -495,12 +506,12 @@ impl BlockMatcher {
 
     /// The number of blocks still unknown.
     pub fn blocks_todo(&self) -> usize {
-        self.known_blocks.iter().filter(|&&k| !k).count()
+        self.known_blocks.len() - self.known_count
     }
 
     /// Whether every block is known.
     pub fn is_complete(&self) -> bool {
-        self.known_blocks.iter().all(|&k| k)
+        self.known_count == self.known_blocks.len()
     }
 
     /// The number of blocks in the target.
@@ -567,6 +578,25 @@ mod tests {
         let got = matcher.submit_source_data(&padded, 0);
         assert_eq!(got.len(), 3);
         assert!(matcher.is_complete());
+    }
+
+    #[test]
+    fn a_block_known_twice_is_counted_once() {
+        let data: Vec<u8> = (0..16u8).collect();
+        let control = make_control(&data, 4);
+        let mut matcher = BlockMatcher::new(&control);
+
+        // Block 1 verified by download, then found again by a scan that
+        // covers it. Counting it twice would report completion early.
+        assert!(matcher.submit_blocks(&data[4..8], 1).unwrap());
+        assert!(matcher.submit_blocks(&data[4..8], 1).unwrap());
+        assert_eq!(matcher.blocks_todo(), 3);
+
+        let mut padded = data[..8].to_vec();
+        padded.resize(12, 0);
+        matcher.submit_source_data(&padded, 0);
+        assert_eq!(matcher.blocks_todo(), 2);
+        assert!(!matcher.is_complete());
     }
 
     #[test]
