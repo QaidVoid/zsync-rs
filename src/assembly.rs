@@ -154,6 +154,14 @@ impl ZsyncAssembly {
         self.matcher.is_complete()
     }
 
+    /// The block size the control file declares.
+    ///
+    /// Progress consumers need it to convert between the block counts that
+    /// [`Self::block_stats`] reports and the byte counts in [`Self::progress`].
+    pub fn blocksize(&self) -> usize {
+        self.control.blocksize
+    }
+
     pub fn block_stats(&self) -> (usize, usize) {
         let total = self.matcher.total_blocks();
         let todo = self.matcher.blocks_todo();
