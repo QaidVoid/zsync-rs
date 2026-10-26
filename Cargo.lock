@@ -614,7 +614,7 @@ checksum = "b268e58e7c693d7c271f93ffc4ba3b380412554231c85bf61ca7af91042a4112"
 
 [[package]]
 name = "zsync-rs"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "clap",
  "md4",
