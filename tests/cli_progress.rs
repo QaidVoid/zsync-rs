@@ -310,6 +310,9 @@ fn json_mode_reports_errors_as_json() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+// Windows forbids `"` in file names. The escaping itself is covered on every
+// platform by the binary's unit tests.
+#[cfg(unix)]
 #[test]
 fn json_escape_handles_quotes_in_paths() {
     // Paths reach the done event verbatim, so a quote in one must not

@@ -420,6 +420,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn json_escape_covers_what_a_path_or_message_can_hold() {
+        assert_eq!(json_escape(r#"a"b"#), r#"a\"b"#);
+        assert_eq!(json_escape(r"C:\dir\f.bin"), r"C:\\dir\\f.bin");
+        assert_eq!(json_escape("line\nnext\ttab\r"), r"line\nnext\ttab\r");
+        assert_eq!(json_escape("\u{1}"), r"\u0001");
+        assert_eq!(json_escape("ünïcode"), "ünïcode");
+    }
+
+    #[test]
     fn bar_fills_in_proportion_to_progress() {
         assert_eq!(
             render_bar(0, 1000),
