@@ -1,5 +1,5 @@
 use std::io::{IsTerminal, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -78,19 +78,28 @@ enum Mode {
     Json,
 }
 
-/// Serialises progress events from the download callback and the main thread.
+/// Serialises progress events from the library's callbacks and the main
+/// thread.
 ///
-/// The library's callback is `Fn + Send + Sync` and owns its closure, so it
-/// cannot hold a plain `&mut` to local state. A mutex-guarded reporter gives
-/// the callback and the main thread one place to write without duplicating
-/// the throttle logic.
+/// The library's callbacks are `Fn + Send + Sync` and own their closures, so
+/// they cannot hold a plain `&mut` to local state. A mutex-guarded reporter
+/// gives the callbacks and the main thread one place to write without
+/// duplicating the throttle logic.
+///
+/// Progress belongs to one phase at a time: a scan of each seed file, the
+/// scan of the downloaded data for repeated blocks, then the download.
 struct Reporter {
     mode: Mode,
     started: Instant,
+    phase: &'static str,
+    /// The file the phase works through, already escaped for JSON.
+    file: Option<String>,
+    /// The last values the library reported, whether or not they were shown.
+    latest: Option<(u64, u64)>,
     last_emit: Option<Instant>,
     last_percent: i32,
     bar_drawn: bool,
-    download_finished: bool,
+    finished: bool,
 }
 
 impl Reporter {
@@ -98,11 +107,38 @@ impl Reporter {
         Self {
             mode,
             started: Instant::now(),
+            phase: "download",
+            file: None,
+            latest: None,
             last_emit: None,
             last_percent: -1,
             bar_drawn: false,
-            download_finished: false,
+            finished: false,
         }
+    }
+
+    /// Starts reporting a new phase, optionally naming the file it reads.
+    fn begin(&mut self, phase: &'static str, file: Option<&Path>) {
+        self.phase = phase;
+        self.file = file.map(|f| json_escape(&f.display().to_string()));
+        self.latest = None;
+        self.last_emit = None;
+        self.last_percent = -1;
+        self.finished = false;
+    }
+
+    fn progress_json(&self, done: u64, total: u64, last: bool) -> String {
+        let elapsed_ms = self.started.elapsed().as_millis();
+        let file = self
+            .file
+            .as_ref()
+            .map(|f| format!(",\"file\":\"{f}\""))
+            .unwrap_or_default();
+        let last = if last { ",\"final\":true" } else { "" };
+        format!(
+            "{{\"event\":\"progress\",\"phase\":\"{}\"{file},\"done_bytes\":{done},\"total_bytes\":{total},\"elapsed_ms\":{elapsed_ms}{last}}}",
+            self.phase
+        )
     }
 
     fn write_line(&self, line: &str) {
@@ -121,14 +157,16 @@ impl Reporter {
         ));
     }
 
-    /// Emits a download progress event if the throttle allows it.
+    /// Emits a progress event for the current phase if the throttle allows
+    /// it.
     ///
     /// Lines mode additionally drops an event that would repeat the previous
     /// whole percent, so a slow transfer does not print the same line twice.
     fn progress(&mut self, done: u64, total: u64) {
-        if self.download_finished {
+        if self.finished {
             return;
         }
+        self.latest = Some((done, total));
         let now = Instant::now();
         if let Some(last) = self.last_emit
             && now.duration_since(last) < PROGRESS_INTERVAL
@@ -145,12 +183,7 @@ impl Reporter {
         self.last_percent = percent;
 
         match self.mode {
-            Mode::Json => {
-                let elapsed_ms = self.started.elapsed().as_millis();
-                self.write_line(&format!(
-                    "{{\"event\":\"progress\",\"phase\":\"download\",\"done_bytes\":{done},\"total_bytes\":{total},\"elapsed_ms\":{elapsed_ms}}}"
-                ));
-            }
+            Mode::Json => self.write_line(&self.progress_json(done, total, false)),
             Mode::Bar => self.draw_bar(done, total),
             Mode::Lines => {
                 eprintln!(
@@ -176,25 +209,20 @@ impl Reporter {
         }
     }
 
-    /// Emits the terminal download event, bypassing the throttle.
+    /// Emits the phase's terminal event, bypassing the throttle.
     ///
     /// A consumer must always see the completed count, even when the last
-    /// block lands inside a throttle window. Human modes print it only when a
-    /// download printed progress, and lines mode only when it would not repeat
-    /// the last line.
-    fn finish_download(&mut self, done: u64, total: u64) {
-        if self.download_finished {
+    /// update lands inside a throttle window. Human modes print it only when
+    /// the phase printed progress, and lines mode only when it would not
+    /// repeat the last line.
+    fn finish(&mut self, done: u64, total: u64) {
+        if self.finished {
             return;
         }
-        self.download_finished = true;
+        self.finished = true;
 
         match self.mode {
-            Mode::Json => {
-                let elapsed_ms = self.started.elapsed().as_millis();
-                self.write_line(&format!(
-                    "{{\"event\":\"progress\",\"phase\":\"download\",\"done_bytes\":{done},\"total_bytes\":{total},\"elapsed_ms\":{elapsed_ms},\"final\":true}}"
-                ));
-            }
+            Mode::Json => self.write_line(&self.progress_json(done, total, true)),
             Mode::Bar => {
                 if self.bar_drawn {
                     self.draw_bar(done, total);
@@ -240,6 +268,17 @@ impl Reporter {
             "{{\"event\":\"error\",\"message\":\"{}\"}}",
             json_escape(message)
         ));
+    }
+}
+
+impl Reporter {
+    /// Ends a scan with the last values the library reported, or silently
+    /// when it reported none because the file was too small to scan.
+    fn finish_scan(&mut self) {
+        match self.latest {
+            Some((done, total)) => self.finish(done, total),
+            None => self.finished = true,
+        }
     }
 }
 
@@ -325,8 +364,24 @@ fn main() {
         }
     }
 
+    let scan_reporter = Arc::clone(&reporter);
+    assembly.set_scan_progress_callback(move |done, total| {
+        if let Ok(mut r) = scan_reporter.lock() {
+            r.progress(done, total);
+        }
+    });
+
     for input_path in &cli.input {
-        match assembly.submit_source_file(input_path) {
+        eprintln!("Scanning {}...", input_path.display());
+        if let Ok(mut r) = reporter.lock() {
+            r.begin("scan", Some(input_path));
+        }
+        let result = assembly.submit_source_file(input_path);
+        if let Ok(mut r) = reporter.lock() {
+            r.finish_scan();
+            r.end_bar();
+        }
+        match result {
             Ok(blocks) => {
                 let (done, total) = assembly.block_stats();
                 eprintln!(
@@ -341,7 +396,16 @@ fn main() {
 
     // Self-referential scan: the temp file may contain duplicate target blocks
     if !cli.input.is_empty() && !assembly.is_complete() {
-        match assembly.submit_self_referential() {
+        eprintln!("Scanning for repeated blocks...");
+        if let Ok(mut r) = reporter.lock() {
+            r.begin("self_scan", None);
+        }
+        let result = assembly.submit_self_referential();
+        if let Ok(mut r) = reporter.lock() {
+            r.finish_scan();
+            r.end_bar();
+        }
+        match result {
             Ok(0) => {}
             Ok(blocks) => {
                 let (done, total) = assembly.block_stats();
@@ -352,6 +416,10 @@ fn main() {
             }
             Err(e) => eprintln!("Warning: self-referential scan failed: {e}"),
         }
+    }
+
+    if let Ok(mut r) = reporter.lock() {
+        r.begin("download", None);
     }
 
     let (done_bytes, total_bytes) = assembly.progress();
@@ -396,7 +464,7 @@ fn main() {
 
     if let Ok(mut r) = reporter.lock() {
         let (done, total) = assembly.progress();
-        r.finish_download(done, total);
+        r.finish(done, total);
         r.emit_phase("verify");
     }
 
