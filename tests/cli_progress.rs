@@ -463,8 +463,8 @@ fn a_failed_download_removes_the_temp_file() {
 
 #[test]
 fn json_mode_reports_seed_scan_progress_before_the_download() {
-    // Over 2 MiB, so the scan reads several 1 MiB chunks. The last 64 KiB
-    // differ from the seed, so a download still follows the scan.
+    // The last 64 KiB differ from the seed, so a download still follows the
+    // scan.
     let len = 2_200_000u32;
     let body: Vec<u8> = (0..len).map(|i| (i % 241) as u8).collect();
     let dir = temp_dir("scan-json");

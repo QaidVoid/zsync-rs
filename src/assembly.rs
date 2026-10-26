@@ -25,7 +25,12 @@ use crate::http::{
 use crate::matcher::BlockMatcher;
 use crate::matcher::MatchError;
 
-const STREAM_CHUNK_SIZE: usize = 1024 * 1024;
+/// How much of a file a scan reads at once.
+///
+/// Large enough that the matcher splits each chunk across every core, which
+/// it only does for inputs of several MiB, while keeping a scan's buffer to
+/// tens of MiB whatever the file's size.
+const STREAM_CHUNK_SIZE: usize = 32 * 1024 * 1024;
 
 /// Why a step of an assembly failed.
 #[derive(Debug, thiserror::Error)]
@@ -201,7 +206,7 @@ impl ZsyncAssembly {
     /// Sets a callback to run as a scan works through a file.
     ///
     /// It receives the bytes scanned so far and the size of the file being
-    /// scanned, once per chunk of about 1 MiB, and last with both equal. Both
+    /// scanned, once per chunk of about 32 MiB, and last with both equal. Both
     /// [`Self::submit_source_file`] and [`Self::submit_self_referential`]
     /// report through it, on the calling thread. A file too small to hold a
     /// match is not scanned and reports nothing.
@@ -743,7 +748,19 @@ mod tests {
     fn a_scan_reports_progress_through_the_whole_file() {
         let dir = std::env::temp_dir().join(format!("zsync-scan-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("mkdir");
-        let data: Vec<u8> = (0..2_500_000u32).map(|i| (i % 251) as u8).collect();
+        // Over two 32 MiB chunks, so the scan reports more than once and each
+        // chunk is large enough for the matcher to split across threads.
+        // Xorshift bytes, because simpler generators repeat at unaligned
+        // offsets, which lets a greedy scan legitimately skip a block.
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let data: Vec<u8> = (0..70_000_000)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                (x >> 32) as u8
+            })
+            .collect();
         let seed = dir.join("seed.bin");
         std::fs::write(&seed, &data).expect("write seed");
 
@@ -755,7 +772,13 @@ mod tests {
         assembly.set_scan_progress_callback(move |done, total| {
             sink.lock().unwrap().push((done, total));
         });
-        assembly.submit_source_file(&seed).expect("scan");
+        let found = assembly.submit_source_file(&seed).expect("scan");
+        assert_eq!(
+            found,
+            assembly.block_stats().1,
+            "every block is in the seed"
+        );
+        assert!(assembly.is_complete());
 
         let calls = calls.lock().unwrap();
         let size = data.len() as u64;

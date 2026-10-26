@@ -7,7 +7,7 @@
 //! [`HashLengths::seq_matches`] of 2, a match that does not continue the
 //! previous one counts only when the block after it matches too, which keeps
 //! short rolling checksums from producing false matches. On a machine with
-//! more than one core, inputs of 32 MiB and more are split across threads.
+//! more than one core, inputs of 4 MiB and more are split across threads.
 
 use crate::checksum::calc_md4;
 use crate::control::{ControlFile, HashLengths};
@@ -439,7 +439,8 @@ impl BlockMatcher {
             .map(|n| n.get())
             .unwrap_or(1);
 
-        let min_per_thread = 16 * 1024 * 1024; // 16 MB per thread minimum
+        // Below this, starting a thread costs more than its share saves.
+        let min_per_thread = 2 * 1024 * 1024;
         let scannable = data.len() - context;
 
         let candidates = if num_threads > 1 && scannable >= min_per_thread * 2 {

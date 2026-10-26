@@ -79,12 +79,12 @@ nothing but JSON:
 
 ```json
 {"event":"start","total_bytes":300000000,"total_blocks":73243,"blocksize":4096}
-{"event":"progress","phase":"scan","file":"old.AppImage","done_bytes":1048576,"total_bytes":300000000,"elapsed_ms":6}
-{"event":"progress","phase":"scan","file":"old.AppImage","done_bytes":300000000,"total_bytes":300000000,"elapsed_ms":879,"final":true}
-{"event":"progress","phase":"self_scan","done_bytes":1048576,"total_bytes":199999488,"elapsed_ms":884}
-{"event":"progress","phase":"self_scan","done_bytes":199999488,"total_bytes":199999488,"elapsed_ms":1802,"final":true}
-{"event":"progress","phase":"download","done_bytes":200003584,"total_bytes":300000000,"elapsed_ms":1803}
-{"event":"progress","phase":"download","done_bytes":300000000,"total_bytes":300000000,"elapsed_ms":6953,"final":true}
+{"event":"progress","phase":"scan","file":"old.AppImage","done_bytes":33554432,"total_bytes":300000000,"elapsed_ms":39}
+{"event":"progress","phase":"scan","file":"old.AppImage","done_bytes":300000000,"total_bytes":300000000,"elapsed_ms":251,"final":true}
+{"event":"progress","phase":"self_scan","done_bytes":33554432,"total_bytes":199999488,"elapsed_ms":283}
+{"event":"progress","phase":"self_scan","done_bytes":199999488,"total_bytes":199999488,"elapsed_ms":421,"final":true}
+{"event":"progress","phase":"download","done_bytes":200003584,"total_bytes":300000000,"elapsed_ms":422}
+{"event":"progress","phase":"download","done_bytes":300000000,"total_bytes":300000000,"elapsed_ms":5600,"final":true}
 {"event":"phase","phase":"verify"}
 {"event":"done","path":"app.AppImage"}
 ```
