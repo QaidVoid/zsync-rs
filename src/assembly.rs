@@ -1,3 +1,15 @@
+//! Assembling a target file from local sources and HTTP ranges.
+//!
+//! A transfer runs in three steps on one [`ZsyncAssembly`]. Local files are
+//! scanned first, and every block they contain is copied into a temporary
+//! file beside the output. The blocks still missing are then downloaded and
+//! verified one at a time. Last, [`ZsyncAssembly::complete`] checks the whole
+//! file against the control file's SHA-1 and renames it into place.
+//!
+//! The temporary file is the output path with its extension replaced by
+//! `zsync-tmp`. Dropping the assembly before it completes removes it, so a
+//! failed or abandoned transfer leaves nothing behind.
+
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::FileExt;
@@ -15,20 +27,35 @@ use crate::matcher::MatchError;
 
 const STREAM_CHUNK_SIZE: usize = 1024 * 1024;
 
+/// Why a step of an assembly failed.
 #[derive(Debug, thiserror::Error)]
 pub enum AssemblyError {
+    /// Reading a source file, or writing, truncating or renaming the
+    /// temporary file, failed.
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+    /// Fetching the control file or a block range failed.
     #[error("HTTP error: {0}")]
     Http(#[from] crate::http::HttpError),
+    /// The block matcher failed.
     #[error("Matcher error: {0}")]
     Matcher(#[from] MatchError),
+    /// The assembly cannot do what was asked of it, such as completing while
+    /// blocks are still missing.
     #[error("Control file error: {0}")]
     Control(String),
+    /// The assembled file's SHA-1 differs from the control file's.
     #[error("Checksum mismatch: expected {expected}, got {actual}")]
-    ChecksumMismatch { expected: String, actual: String },
+    ChecksumMismatch {
+        /// The digest from the control file, as written there.
+        expected: String,
+        /// The digest of the assembled file, in lowercase hex.
+        actual: String,
+    },
+    /// The control file lists no URL to download blocks from.
     #[error("No URLs available")]
     NoUrls,
+    /// The abort flag was raised during a scan or a download.
     #[error("Aborted")]
     Aborted,
 }
@@ -41,8 +68,11 @@ fn aborted(flag: &Option<Arc<AtomicBool>>) -> bool {
     flag.as_ref().is_some_and(|f| f.load(Ordering::Relaxed))
 }
 
+/// A callback receiving `(done_bytes, total_bytes)`, as
+/// [`ZsyncAssembly::progress`] reports them.
 pub type ProgressCallback = Box<dyn Fn(u64, u64) + Send + Sync>;
 
+/// One transfer of a target file, from a control file to the finished output.
 pub struct ZsyncAssembly {
     control: ControlFile,
     base_url: Option<String>,
@@ -57,10 +87,17 @@ pub struct ZsyncAssembly {
 }
 
 impl ZsyncAssembly {
+    /// Assemble the target `control` describes into `output_path`.
+    ///
+    /// There is no base URL, so the control file's URLs must be absolute.
+    /// Nothing is written until a block is found or downloaded.
     pub fn new(control: ControlFile, output_path: &Path) -> Result<Self, AssemblyError> {
         Self::with_base_url(control, output_path, None)
     }
 
+    /// Assemble with relative control file URLs resolved against `base_url`.
+    ///
+    /// The base is joined as given, so for a directory it should end in `/`.
     pub fn with_base_url(
         control: ControlFile,
         output_path: &Path,
@@ -97,6 +134,16 @@ impl ZsyncAssembly {
         })
     }
 
+    /// Fetch the control file at `control_url` and assemble into
+    /// `output_path`.
+    ///
+    /// Relative URLs in the control file resolve against `control_url`'s
+    /// directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AssemblyError::Http`] when the control file cannot be
+    /// fetched or does not parse.
     pub fn from_url(control_url: &str, output_path: &Path) -> Result<Self, AssemblyError> {
         Self::from_url_with_client(control_url, output_path, HttpClient::new())
     }
@@ -115,6 +162,12 @@ impl ZsyncAssembly {
         Self::with_client(control, output_path, Some(&base_url), http)
     }
 
+    /// Sets how many known bytes may separate two needed ranges before they
+    /// are fetched with separate requests.
+    ///
+    /// Ranges closer than this are fetched as one, downloading the gap again
+    /// to save a round trip. The default is
+    /// [`DEFAULT_RANGE_GAP_THRESHOLD`].
     pub fn set_range_gap_threshold(&mut self, threshold: u64) {
         self.range_gap_threshold = threshold;
     }
@@ -128,6 +181,12 @@ impl ZsyncAssembly {
         self.abort_flag = Some(flag);
     }
 
+    /// Sets a callback to run after each block is downloaded and verified.
+    ///
+    /// It receives the values [`Self::progress`] returns at that point, and
+    /// runs on the thread calling [`Self::download_missing_blocks`], so a slow
+    /// callback slows the download. Blocks found in local files do not
+    /// trigger it.
     pub fn set_progress_callback<F>(&mut self, callback: F)
     where
         F: Fn(u64, u64) + Send + Sync + 'static,
@@ -142,6 +201,9 @@ impl ZsyncAssembly {
         }
     }
 
+    /// Bytes of the target known so far, and the target's length.
+    ///
+    /// The count is known blocks times the block size, capped at the length.
     pub fn progress(&self) -> (u64, u64) {
         let total = self.control.length;
         let got = self.matcher.blocks_todo();
@@ -150,6 +212,7 @@ impl ZsyncAssembly {
         (done_bytes.min(total), total)
     }
 
+    /// Whether every block of the target is known.
     pub fn is_complete(&self) -> bool {
         self.matcher.is_complete()
     }
@@ -162,12 +225,25 @@ impl ZsyncAssembly {
         self.control.blocksize
     }
 
+    /// Blocks known so far, and the target's total block count.
     pub fn block_stats(&self) -> (usize, usize) {
         let total = self.matcher.total_blocks();
         let todo = self.matcher.blocks_todo();
         (total - todo, total)
     }
 
+    /// Scans the file at `path` for blocks of the target, at any offset, and
+    /// copies each one found into the temporary file.
+    ///
+    /// Returns the number of blocks found. A file shorter than one block, or
+    /// two when [`HashLengths::seq_matches`](crate::control::HashLengths::seq_matches)
+    /// is 2, cannot contain a match and returns 0.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AssemblyError::Io`] when reading the source or writing the
+    /// temporary file fails, and [`AssemblyError::Aborted`] when the abort
+    /// flag is raised.
     pub fn submit_source_file(&mut self, path: &Path) -> Result<usize, AssemblyError> {
         let file = File::open(path)?;
         let file_size = file.metadata()?.len() as usize;
@@ -258,6 +334,18 @@ impl ZsyncAssembly {
         Ok(total_matched)
     }
 
+    /// Scans the temporary file itself for further blocks of the target.
+    ///
+    /// A target that repeats a block, such as a run of zeros, needs it only
+    /// once to fill every copy. Run this after the source files, when the
+    /// temporary file holds what they supplied. Returns the number of blocks
+    /// found, which is 0 when nothing has been written yet.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AssemblyError::Io`] when reading or writing the temporary
+    /// file fails, and [`AssemblyError::Aborted`] when the abort flag is
+    /// raised.
     pub fn submit_self_referential(&mut self) -> Result<usize, AssemblyError> {
         if self.file.is_none() {
             return Ok(0);
@@ -371,6 +459,25 @@ impl ZsyncAssembly {
         Ok(self.file.as_mut().unwrap())
     }
 
+    /// Downloads the blocks still missing and writes those that verify.
+    ///
+    /// Blocks are fetched from the control file's first URL, with nearby
+    /// ranges merged as [`Self::set_range_gap_threshold`] allows. Each block
+    /// is checked against its checksum before it is written. One that fails
+    /// stays missing, so a server sending wrong data cannot corrupt the
+    /// output.
+    ///
+    /// Returns the number of blocks written. Call it until it returns 0, then
+    /// check [`Self::is_complete`]: 0 means nothing was missing or nothing
+    /// that arrived verified, and looping on [`Self::is_complete`] alone
+    /// never ends against a server that sends the wrong bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AssemblyError::NoUrls`] when the control file lists no URL,
+    /// [`AssemblyError::Http`] or [`AssemblyError::Io`] when a request or a
+    /// write fails, and [`AssemblyError::Aborted`] when the abort flag is
+    /// raised.
     pub fn download_missing_blocks(&mut self) -> Result<usize, AssemblyError> {
         let relative_url = self
             .control
@@ -493,6 +600,18 @@ impl ZsyncAssembly {
         Ok(downloaded_blocks)
     }
 
+    /// Verifies the assembled file and moves it to the output path.
+    ///
+    /// The temporary file is cut to the target's length, its SHA-1 is
+    /// compared with the control file's when the control file has one, and
+    /// it is renamed to the output path. On any error the assembly is
+    /// dropped, which removes the temporary file.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AssemblyError::Control`] when blocks are still missing,
+    /// [`AssemblyError::ChecksumMismatch`] when the digests differ, and
+    /// [`AssemblyError::Io`] when reading, truncating or renaming fails.
     pub fn complete(mut self) -> Result<(), AssemblyError> {
         if !self.matcher.is_complete() {
             return Err(AssemblyError::Control(

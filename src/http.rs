@@ -1,20 +1,36 @@
+//! HTTP transport: control files, byte ranges, and planning range requests.
+//!
+//! [`HttpClient`] fetches a control file and the byte ranges of a target. The
+//! free functions turn the block ranges a matcher still needs into byte
+//! ranges, and merge ranges separated by small gaps, since one request that
+//! re-downloads a few known bytes is usually cheaper than another round trip.
+
 use std::io::Read;
 use std::time::Duration;
 
 use crate::control::ControlFile;
 
+/// Why a fetch failed.
 #[derive(Debug, thiserror::Error)]
 pub enum HttpError {
+    /// The request failed, the server answered with an unexpected status, or
+    /// a fetched control file did not parse. The message says which.
     #[error("HTTP error: {0}")]
     Http(String),
+    /// Reading a response body failed.
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+    /// A URL could not be used. Not currently returned by this crate.
     #[error("Invalid URL: {0}")]
     InvalidUrl(String),
+    /// There was no URL to fetch from. Not currently returned by this crate.
     #[error("No URLs available")]
     NoUrls,
 }
 
+/// The body of one range response, capped at the length requested.
+///
+/// Returned by [`HttpClient::fetch_range_reader`].
 pub struct HttpRangeReader {
     reader: Box<dyn std::io::Read + Send + Sync>,
 }
@@ -88,6 +104,12 @@ impl HttpClient {
         Self { agent }
     }
 
+    /// Fetches and parses the control file at `url`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HttpError::Http`] when the request fails or the response
+    /// does not parse as a control file.
     pub fn fetch_control_file(&self, url: &str) -> Result<ControlFile, HttpError> {
         let response = self
             .agent
@@ -106,6 +128,16 @@ impl HttpClient {
     /// the range is consumed in full, and callers that accumulate it, such
     /// as block assembly, grow a buffer to match. Bytes past the range
     /// were never asked for and are of no use, so they are not read.
+    ///
+    /// A `200 OK` is accepted as well as `206 Partial Content`. A server that
+    /// ignores `Range` sends the file from its first byte, so for a range
+    /// that does not start at zero the reader yields the wrong bytes, and it
+    /// falls to the caller's block checksums to reject them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HttpError::Http`] when the request fails or the status is
+    /// neither 200 nor 206.
     pub fn fetch_range_reader(
         &self,
         url: &str,
@@ -135,6 +167,15 @@ impl HttpClient {
         })
     }
 
+    /// Fetches `start..=end` of `url` into memory.
+    ///
+    /// The same cap and status handling as [`Self::fetch_range_reader`]
+    /// apply.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HttpError::Http`] when the request fails and
+    /// [`HttpError::Io`] when reading the body fails.
     pub fn fetch_range(&self, url: &str, start: u64, end: u64) -> Result<Vec<u8>, HttpError> {
         let mut reader = self.fetch_range_reader(url, start, end)?;
         let mut buf = Vec::new();
@@ -142,6 +183,16 @@ impl HttpClient {
         Ok(buf)
     }
 
+    /// Fetches each inclusive range in `ranges`, one request at a time.
+    ///
+    /// Each body is paired with its start offset rounded down to a multiple
+    /// of `blocksize`. The ranges are expected to start on a block boundary,
+    /// as those from [`byte_ranges_from_block_ranges`] do; otherwise the
+    /// offset names a point before the body's first byte.
+    ///
+    /// # Errors
+    ///
+    /// Stops at and returns the first error from [`Self::fetch_range`].
     pub fn fetch_ranges(
         &self,
         url: &str,
@@ -164,7 +215,10 @@ impl HttpClient {
 pub const DEFAULT_RANGE_GAP_THRESHOLD: u64 = 256 * 1024;
 
 /// Merge byte ranges to minimize HTTP requests.
-/// Gaps smaller than the threshold are merged to save HTTP round-trips.
+///
+/// `ranges` are inclusive and sorted by start, without overlap. Two neighbours
+/// separated by at most `gap_threshold` bytes become one range that also
+/// covers the gap, so a threshold of zero merges only ranges that touch.
 pub fn merge_byte_ranges(ranges: &[(u64, u64)], gap_threshold: u64) -> Vec<(u64, u64)> {
     if ranges.len() <= 1 {
         return ranges.to_vec();
@@ -183,6 +237,13 @@ pub fn merge_byte_ranges(ranges: &[(u64, u64)], gap_threshold: u64) -> Vec<(u64,
     merged
 }
 
+/// Converts block ranges into the byte ranges that hold them.
+///
+/// Each block range is half-open, from its first block to one past its last,
+/// as [`BlockMatcher::needed_block_ranges`](crate::BlockMatcher::needed_block_ranges)
+/// returns them. Each byte range is inclusive, ready for a `Range` header, and
+/// the last one is clamped to `file_length` so a short final block is not
+/// requested past the end of the file.
 pub fn byte_ranges_from_block_ranges(
     block_ranges: &[(usize, usize)],
     blocksize: usize,

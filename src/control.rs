@@ -1,68 +1,123 @@
+//! The `.zsync` control file: parsing, generation and writing.
+//!
+//! A control file is a text header of `Key: value` lines, ended by a blank
+//! line, followed by one binary record per block of the target. Each record
+//! holds the block's rolling checksum and then its MD4 digest, both cut down
+//! to the lengths the `Hash-Lengths` header gives. The rolling checksum is
+//! stored big-endian and loses its high-order bytes first. [`ControlFile`]
+//! holds the parsed form and the same type round-trips through
+//! [`ControlFile::write`], which is how `zsyncmake` produces one.
+
 use std::io::{BufRead, Read, Seek, SeekFrom, Write};
 
 use crate::checksum::{calc_md4, calc_sha1_stream};
 use crate::rsum::{Rsum, calc_rsum_block};
 
+/// Why [`ControlFile::generate`] could not describe a file.
 #[derive(Debug, thiserror::Error)]
 pub enum GenerateError {
+    /// Reading or seeking the input failed.
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+    /// The input has no bytes, and a control file cannot describe a target
+    /// with no blocks.
     #[error("file is empty")]
     EmptyFile,
 }
 
+/// Why [`ControlFile::write`] failed.
 #[derive(Debug, thiserror::Error)]
 pub enum WriteError {
+    /// The writer reported an error.
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 }
 
+/// Why [`ControlFile::parse`] rejected its input.
 #[derive(Debug, thiserror::Error)]
 pub enum ParseError {
+    /// Reading failed, including the block records ending early.
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+    /// A header line has no `:`, or a `SHA-1` value is not 40 characters.
     #[error("Invalid header: {0}")]
     InvalidHeader(String),
+    /// A header the format requires, named here, is absent.
     #[error("Missing required field: {0}")]
     MissingField(String),
+    /// `Blocksize` is not a number or not a power of two.
     #[error("Invalid blocksize: {0}")]
     InvalidBlocksize(String),
+    /// `Hash-Lengths` is not three comma-separated numbers within the ranges
+    /// [`HashLengths`] documents.
     #[error("Invalid hash lengths: {0}")]
     InvalidHashLengths(String),
+    /// `Length` is not a number, or implies more than 2^26 blocks.
     #[error("Invalid length: {0}")]
     InvalidLength(String),
+    /// The input ended before the blank line that closes the header.
     #[error("Unexpected end of file")]
     UnexpectedEof,
+    /// The header ran past the given number of bytes without ending.
     #[error("Header section exceeds {0} bytes")]
     HeaderTooLarge(u64),
 }
 
+/// The checksums of one target block.
 #[derive(Debug, Clone, Copy)]
 pub struct BlockChecksum {
+    /// The rolling checksum, with any bytes the control file does not store
+    /// left as zero.
     pub rsum: Rsum,
+    /// The MD4 digest. Only the first [`HashLengths::checksum_bytes`] are
+    /// significant, and the rest are zero.
     pub checksum: [u8; 16],
 }
 
+/// A parsed control file: what the target is, where to fetch it, and the
+/// checksum of every block.
 #[derive(Debug, Clone)]
 pub struct ControlFile {
+    /// The `zsync` header, naming the version of the tool that wrote the
+    /// file, or empty when the header is absent.
     pub version: String,
+    /// The suggested name for the target file.
     pub filename: Option<String>,
+    /// The target's modification time, verbatim from the `MTime` header.
     pub mtime: Option<String>,
+    /// The block size in bytes, always a power of two.
     pub blocksize: usize,
+    /// The target's length in bytes.
     pub length: u64,
+    /// How much of each block checksum the file stores.
     pub hash_lengths: HashLengths,
+    /// Where the target can be fetched, in the order given. A relative URL
+    /// resolves against the control file's own location.
     pub urls: Vec<String>,
+    /// The target's SHA-1 as 40 hex digits, verbatim from the `SHA-1` header.
     pub sha1: Option<String>,
+    /// One entry per block of the target, in order.
     pub block_checksums: Vec<BlockChecksum>,
 }
 
+/// The `Hash-Lengths` header: how strict matching is and how many checksum
+/// bytes each block record stores.
+///
+/// Shorter checksums make a smaller control file at the cost of more false
+/// candidates, which is why a large target needs longer ones.
 #[derive(Debug, Clone, Copy)]
 pub struct HashLengths {
+    /// How many consecutive blocks must match together before a match is
+    /// accepted, either 1 or 2.
     pub seq_matches: u8,
+    /// Bytes of rolling checksum stored per block, from 1 to 4.
     pub rsum_bytes: u8,
+    /// Bytes of MD4 digest stored per block, from 3 to 16.
     pub checksum_bytes: u8,
 }
 
+/// Full-length checksums with single-block matching, which is what a control
+/// file without a `Hash-Lengths` header means.
 impl Default for HashLengths {
     fn default() -> Self {
         Self {
@@ -80,7 +135,13 @@ impl ControlFile {
     /// network, and both a single unterminated line and an endless run of
     /// `URL:` lines would otherwise grow without bound, letting the origin
     /// choose how much memory the client spends before any of it is
-    /// validated.
+    /// validated. Unknown headers are skipped.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ParseError`] naming the first problem found in the header,
+    /// or [`ParseError::Io`] when reading fails or the block records end
+    /// before every block has one.
     pub fn parse<R: Read>(reader: R) -> Result<Self, ParseError> {
         /// Generous: real headers are a few hundred bytes, and even a long
         /// mirror list is far below this.
@@ -265,12 +326,25 @@ impl ControlFile {
         Ok(checksums)
     }
 
+    /// The number of blocks in the target.
     pub fn num_blocks(&self) -> usize {
         self.block_checksums.len()
     }
 
     /// Generate a control file by scanning an input file.
-    /// Blocksize is auto-calculated if `None`.
+    ///
+    /// Every block is checksummed, with the last one padded with zeros to a
+    /// full block, and the whole input is hashed with SHA-1. A `blocksize` of
+    /// `None` picks 2048 bytes for inputs under 100,000,000 bytes and 4096
+    /// otherwise. A given size must be a power of two, or the result will not
+    /// parse. The hash lengths are derived from the file and block sizes
+    /// with the formulas `zsyncmake` uses, `url` becomes the only URL, and
+    /// the version is written as `0.6.2`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GenerateError::EmptyFile`] for an empty input and
+    /// [`GenerateError::Io`] when reading or seeking fails.
     pub fn generate<R: Read + Seek>(
         reader: &mut R,
         filename: &str,
@@ -333,6 +407,13 @@ impl ControlFile {
     }
 
     /// Write the control file to a writer.
+    ///
+    /// The block records are written at the lengths [`Self::hash_lengths`]
+    /// gives, so a file written here parses back to the same checksums.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WriteError::Io`] when the writer fails.
     pub fn write<W: Write>(&self, writer: &mut W) -> Result<(), WriteError> {
         writeln!(writer, "zsync: {}", self.version)?;
         if let Some(ref filename) = self.filename {

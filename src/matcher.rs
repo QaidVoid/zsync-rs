@@ -1,9 +1,22 @@
+//! Finding target blocks in local data, and tracking which are known.
+//!
+//! [`BlockMatcher`] indexes the target's block checksums and then tests every
+//! byte offset of the data it is given. The rolling checksum slides along one
+//! byte at a time, a bit filter and a hash table reject most offsets without
+//! a lookup, and MD4 confirms what survives. With
+//! [`HashLengths::seq_matches`] of 2, a match that does not continue the
+//! previous one counts only when the block after it matches too, which keeps
+//! short rolling checksums from producing false matches. On a machine with
+//! more than one core, inputs of 32 MiB and more are split across threads.
+
 use crate::checksum::calc_md4;
 use crate::control::{ControlFile, HashLengths};
 use crate::rsum::{Rsum, calc_rsum_block};
 
+/// Why matching failed.
 #[derive(Debug, thiserror::Error)]
 pub enum MatchError {
+    /// An I/O error. Not currently returned by this crate.
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -191,6 +204,11 @@ impl ScanState<'_> {
     }
 }
 
+/// The index of a target's blocks and the record of which are known.
+///
+/// Every block starts unknown. A block becomes known when a scan finds it in
+/// local data or when downloaded data verifies against its checksum, and the
+/// blocks still unknown are what remains to download.
 pub struct BlockMatcher {
     blocksize: usize,
     blockshift: u8,
@@ -207,6 +225,7 @@ pub struct BlockMatcher {
 }
 
 impl BlockMatcher {
+    /// Indexes the block checksums in `control`, with every block unknown.
     pub fn new(control: &ControlFile) -> Self {
         let num_blocks = control.block_checksums.len();
         let seq_matches = control.hash_lengths.seq_matches as u32;
@@ -339,6 +358,18 @@ impl BlockMatcher {
         }
     }
 
+    /// Verifies `data` as consecutive whole blocks starting at block
+    /// `block_start`, marking each one that matches its checksum as known.
+    ///
+    /// A final block shorter than the block size must be padded with zeros
+    /// to a full block, as the checksums were computed that way. Trailing
+    /// bytes short of a block are ignored, as are blocks past the end of the
+    /// target. Verification stops at the first mismatch and returns `false`,
+    /// leaving the blocks before it known.
+    ///
+    /// # Errors
+    ///
+    /// None at present. The `Result` leaves room for one.
     pub fn submit_blocks(&mut self, data: &[u8], block_start: usize) -> Result<bool, MatchError> {
         let blocksize = self.blocksize;
         let checksum_bytes = self.hash_lengths.checksum_bytes as usize;
@@ -363,6 +394,17 @@ impl BlockMatcher {
         Ok(true)
     }
 
+    /// Scans `data` for target blocks at every byte offset and marks the ones
+    /// found as known.
+    ///
+    /// `offset` is where `data` starts in its source, and the returned
+    /// `(block_id, source_offset)` pairs give absolute offsets in that
+    /// source. Offsets are tested only up to `blocksize * seq_matches` bytes
+    /// before the end of `data`, so a caller scanning a file in chunks must
+    /// overlap them by that much and pad the end of the file with zeros.
+    ///
+    /// Each block is reported at most once, at the first offset found. Found
+    /// blocks leave the index, so a later scan does not report them again.
     pub fn submit_source_data(&mut self, data: &[u8], offset: u64) -> Vec<(usize, usize)> {
         let context = self.blocksize * self.hash_lengths.seq_matches as usize;
         if data.len() < context {
@@ -423,6 +465,8 @@ impl BlockMatcher {
         matched_blocks
     }
 
+    /// The runs of blocks still unknown, as half-open `(first, end)` ranges
+    /// in ascending order.
     pub fn needed_block_ranges(&self) -> Vec<(usize, usize)> {
         let mut ranges = Vec::new();
         let mut start: Option<usize> = None;
@@ -443,18 +487,23 @@ impl BlockMatcher {
         ranges
     }
 
+    /// Whether block `block_id` is known, which is `false` past the end of the
+    /// target.
     pub fn is_block_known(&self, block_id: usize) -> bool {
         block_id < self.known_blocks.len() && self.known_blocks[block_id]
     }
 
+    /// The number of blocks still unknown.
     pub fn blocks_todo(&self) -> usize {
         self.known_blocks.iter().filter(|&&k| !k).count()
     }
 
+    /// Whether every block is known.
     pub fn is_complete(&self) -> bool {
         self.known_blocks.iter().all(|&k| k)
     }
 
+    /// The number of blocks in the target.
     pub fn total_blocks(&self) -> usize {
         self.targets.len()
     }

@@ -1,9 +1,21 @@
+//! The rolling checksum that lets a scan test every byte offset cheaply.
+//!
+//! This is the rsync weak checksum: two 16-bit sums over a block, both
+//! wrapping. Sliding the block one byte along updates them from the byte that
+//! leaves and the byte that enters, without revisiting the rest, which is what
+//! makes testing every offset of a source file affordable. A match here is
+//! only a candidate; [`crate::checksum::calc_md4`] confirms it.
+
+/// The rolling checksum of one block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Rsum {
+    /// The sum of the block's bytes, modulo 2^16.
     pub a: u16,
+    /// The sum of the running values of `a` after each byte, modulo 2^16.
     pub b: u16,
 }
 
+/// Computes the rolling checksum of `data` from scratch.
 pub fn calc_rsum_block(data: &[u8]) -> Rsum {
     let mut a: u16 = 0;
     let mut b: u16 = 0;

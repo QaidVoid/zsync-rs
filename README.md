@@ -97,12 +97,10 @@ let mut assembly = ZsyncAssembly::from_url(
 // Match blocks from a local seed file
 assembly.submit_source_file(Path::new("old-version.bin"))?;
 
-// Download whatever's missing
-while !assembly.is_complete() {
-    assembly.download_missing_blocks()?;
-}
+// Download whatever's missing, until a pass adds nothing
+while assembly.download_missing_blocks()? > 0 {}
 
-// Verify checksum and finalize
+// Fail if any block is still missing, then verify checksum and finalize
 assembly.complete()?;
 ```
 

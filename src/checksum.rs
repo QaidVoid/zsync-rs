@@ -1,3 +1,11 @@
+//! The strong hashes zsync relies on.
+//!
+//! MD4 is the per-block checksum that confirms a candidate block once its
+//! rolling checksum matches. SHA-1 covers the whole target and is the final
+//! check that an assembled file is the one the control file describes.
+//! Neither is used for security: they detect accidental mismatches, and the
+//! format fixes both choices.
+
 use std::io::Read;
 
 use md4::{Digest, Md4};
@@ -5,6 +13,7 @@ use sha1::Sha1;
 
 const SHA1_BUFFER_SIZE: usize = 64 * 1024;
 
+/// The MD4 digest of `data`.
 pub fn calc_md4(data: &[u8]) -> [u8; 16] {
     let mut hasher = Md4::new();
     hasher.update(data);
@@ -14,6 +23,7 @@ pub fn calc_md4(data: &[u8]) -> [u8; 16] {
     checksum
 }
 
+/// The SHA-1 digest of `data`.
 pub fn calc_sha1(data: &[u8]) -> [u8; 20] {
     let mut hasher = Sha1::new();
     hasher.update(data);
@@ -23,6 +33,14 @@ pub fn calc_sha1(data: &[u8]) -> [u8; 20] {
     checksum
 }
 
+/// The SHA-1 digest of everything `reader` yields until end of file.
+///
+/// The input is read in 64 KiB chunks, so a file of any size hashes in
+/// constant memory.
+///
+/// # Errors
+///
+/// Returns the first error `reader` reports.
 pub fn calc_sha1_stream<R: Read>(reader: &mut R) -> std::io::Result<[u8; 20]> {
     let mut hasher = Sha1::new();
     let mut buf = [0u8; SHA1_BUFFER_SIZE];
