@@ -13,6 +13,14 @@ use std::io::{BufRead, Read, Seek, SeekFrom, Write};
 use crate::checksum::{calc_md4, calc_sha1_stream};
 use crate::rsum::{Rsum, calc_rsum_block};
 
+/// The largest block size a control file may use, 1 MiB.
+///
+/// The client allocates buffers a few blocks long, and the block size comes
+/// from a file fetched over the network, so without a bound a single header
+/// line could make it reserve any amount of memory. `zsyncmake` picks 2048 or
+/// 4096 on its own, so the cap leaves ample room above that.
+pub const MAX_BLOCKSIZE: usize = 1 << 20;
+
 /// Why [`ControlFile::generate`] could not describe a file.
 #[derive(Debug, thiserror::Error)]
 pub enum GenerateError {
@@ -45,7 +53,8 @@ pub enum ParseError {
     /// A header the format requires, named here, is absent.
     #[error("Missing required field: {0}")]
     MissingField(String),
-    /// `Blocksize` is not a number or not a power of two.
+    /// `Blocksize` is not a number, not a power of two, or larger than
+    /// [`MAX_BLOCKSIZE`].
     #[error("Invalid blocksize: {0}")]
     InvalidBlocksize(String),
     /// `Hash-Lengths` is not three comma-separated numbers within the ranges
@@ -195,7 +204,7 @@ impl ControlFile {
                     let bs: usize = value
                         .parse()
                         .map_err(|_| ParseError::InvalidBlocksize(value.to_string()))?;
-                    if bs == 0 || (bs & (bs - 1)) != 0 {
+                    if !bs.is_power_of_two() || bs > MAX_BLOCKSIZE {
                         return Err(ParseError::InvalidBlocksize(value.to_string()));
                     }
                     blocksize = Some(bs);
@@ -582,6 +591,24 @@ mod tests {
         let data = b"zsync: 0.6.2\nBlocksize: 1000\nLength: 4096\n\n";
         let result = ControlFile::parse(&data[..]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn a_block_size_past_the_cap_is_refused() {
+        let header = |bs: usize| {
+            let mut data =
+                format!("zsync: 0.6.2\nBlocksize: {bs}\nLength: 1\nHash-Lengths: 1,4,16\n\n")
+                    .into_bytes();
+            data.extend_from_slice(&[0u8; 20]);
+            data
+        };
+
+        assert!(ControlFile::parse(&header(MAX_BLOCKSIZE)[..]).is_ok());
+        let err = ControlFile::parse(&header(MAX_BLOCKSIZE * 2)[..]).expect_err("past the cap");
+        assert!(
+            matches!(err, ParseError::InvalidBlocksize(_)),
+            "expected a blocksize error, got: {err}"
+        );
     }
 
     #[test]
