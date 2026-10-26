@@ -642,15 +642,17 @@ impl ZsyncAssembly {
     ///
     /// The temporary file is cut to the target's length, its SHA-1 is
     /// compared with the control file's when the control file has one, and
-    /// it is renamed to the output path. A file already at the output path
-    /// is replaced, and its permissions carry over to the new one. On any error the assembly is
+    /// it is flushed to disk and renamed to the output path, so a crash
+    /// cannot leave a partly written file there. A file already at the output
+    /// path is replaced, and its permissions carry over to the new one. On any error the assembly is
     /// dropped, which removes the temporary file.
     ///
     /// # Errors
     ///
     /// Returns [`AssemblyError::Control`] when blocks are still missing,
     /// [`AssemblyError::ChecksumMismatch`] when the digests differ, and
-    /// [`AssemblyError::Io`] when reading, truncating or renaming fails.
+    /// [`AssemblyError::Io`] when reading, truncating, flushing or renaming
+    /// fails.
     pub fn complete(mut self) -> Result<(), AssemblyError> {
         if !self.matcher.is_complete() {
             return Err(AssemblyError::Control(
@@ -676,6 +678,7 @@ impl ZsyncAssembly {
                 });
             }
         }
+        file.sync_all()?;
 
         self.file.take();
         // Replacing an existing file, such as an executable AppImage updated
