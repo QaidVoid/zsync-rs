@@ -427,8 +427,8 @@ impl BlockMatcher {
     /// before the end of `data`, so a caller scanning a file in chunks must
     /// overlap them by that much and pad the end of the file with zeros.
     ///
-    /// Each block is reported at most once, at the first offset found. Found
-    /// blocks leave the index, so a later scan does not report them again.
+    /// Only blocks that were not already known are reported, each once at the
+    /// first offset found, so the result counts what this scan added.
     pub fn submit_source_data(&mut self, data: &[u8], offset: u64) -> Vec<(usize, usize)> {
         let context = self.blocksize * self.hash_lengths.seq_matches as usize;
         if data.len() < context {
@@ -475,12 +475,12 @@ impl BlockMatcher {
             state.scan_chunk(data, offset as usize)
         };
 
-        // Deduplicate: first match per block_id wins
-        let mut seen = vec![false; self.targets.len()];
+        // A pair match also reports its second block, and chunks overlap, so
+        // candidates can repeat a block or name one already known. Only the
+        // first sighting of a still unknown block counts.
         let mut matched_blocks = Vec::new();
         for (block_id, offset) in candidates {
-            if !seen[block_id] {
-                seen[block_id] = true;
+            if !self.known_blocks[block_id] {
                 self.mark_known(block_id);
                 self.remove_block_from_hash(block_id);
                 matched_blocks.push((block_id, offset));
@@ -633,7 +633,8 @@ mod tests {
 
         let mut padded = data[..8].to_vec();
         padded.resize(12, 0);
-        matcher.submit_source_data(&padded, 0);
+        let found = matcher.submit_source_data(&padded, 0);
+        assert_eq!(found, vec![(0, 0)], "only the newly found block counts");
         assert_eq!(matcher.blocks_todo(), 2);
         assert!(!matcher.is_complete());
     }
