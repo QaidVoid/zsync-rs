@@ -315,7 +315,7 @@ fn main() {
         }
     };
 
-    assembly.set_range_gap_threshold(cli.range_gap * 1024);
+    assembly.set_range_gap_threshold(cli.range_gap.saturating_mul(1024));
 
     {
         let (_, total_bytes) = assembly.progress();
