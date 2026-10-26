@@ -1,4 +1,7 @@
+use std::io::Write;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use clap::Parser;
 use zsync_rs::ZsyncAssembly;
@@ -22,6 +25,10 @@ struct Cli {
     /// Gap threshold in KiB for merging HTTP range requests (default: 256)
     #[arg(long, value_name = "KIB", default_value_t = 256)]
     range_gap: u64,
+
+    /// Emit newline-delimited JSON progress events on stdout
+    #[arg(long)]
+    json: bool,
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -50,8 +57,189 @@ fn format_pct(done: usize, total: usize) -> String {
     format!("{:.2}", done as f64 / total as f64 * 100.0)
 }
 
+/// How often a progress event may be emitted.
+///
+/// The library reports once per block, which is thousands of events for a
+/// large file. Throttling here keeps terminal output readable and bounds the
+/// volume a JSONL consumer has to parse. The library's own behaviour is
+/// unchanged; this is presentation only.
+const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Where progress goes and how often.
+#[derive(Clone, Copy, PartialEq)]
+enum Mode {
+    Human,
+    Json,
+}
+
+/// Serialises progress events from the download callback and the main thread.
+///
+/// The library's callback is `Fn + Send + Sync` and owns its closure, so it
+/// cannot hold a plain `&mut` to local state. A mutex-guarded reporter gives
+/// the callback and the main thread one place to write without duplicating
+/// the throttle logic.
+struct Reporter {
+    mode: Mode,
+    started: Instant,
+    last_emit: Option<Instant>,
+    last_percent: i32,
+    download_finished: bool,
+}
+
+impl Reporter {
+    fn new(mode: Mode) -> Self {
+        Self {
+            mode,
+            started: Instant::now(),
+            last_emit: None,
+            last_percent: -1,
+            download_finished: false,
+        }
+    }
+
+    fn write_line(&self, line: &str) {
+        let mut out = std::io::stdout().lock();
+        // A closed consumer must not abort a running transfer.
+        let _ = writeln!(out, "{line}");
+        let _ = out.flush();
+    }
+
+    fn emit_start(&self, total_bytes: u64, total_blocks: usize, blocksize: usize) {
+        if self.mode != Mode::Json {
+            return;
+        }
+        self.write_line(&format!(
+            "{{\"event\":\"start\",\"total_bytes\":{total_bytes},\"total_blocks\":{total_blocks},\"blocksize\":{blocksize}}}"
+        ));
+    }
+
+    /// Emits a download progress event if the throttle allows it.
+    ///
+    /// Human mode additionally drops an event that would repeat the previous
+    /// whole percent, so a slow transfer does not print the same line twice.
+    fn progress(&mut self, done: u64, total: u64) {
+        if self.download_finished {
+            return;
+        }
+        let now = Instant::now();
+        if let Some(last) = self.last_emit
+            && now.duration_since(last) < PROGRESS_INTERVAL
+        {
+            return;
+        }
+
+        let percent = whole_percent(done, total);
+        if self.mode == Mode::Human && percent == self.last_percent {
+            return;
+        }
+
+        self.last_emit = Some(now);
+        self.last_percent = percent;
+
+        match self.mode {
+            Mode::Json => {
+                let elapsed_ms = self.started.elapsed().as_millis();
+                self.write_line(&format!(
+                    "{{\"event\":\"progress\",\"phase\":\"download\",\"done_bytes\":{done},\"total_bytes\":{total},\"elapsed_ms\":{elapsed_ms}}}"
+                ));
+            }
+            Mode::Human => {
+                eprintln!(
+                    "  {} / {} ({percent}%)",
+                    format_bytes(done),
+                    format_bytes(total)
+                );
+            }
+        }
+    }
+
+    /// Emits the terminal download event, bypassing the throttle.
+    ///
+    /// A consumer must always see the completed count, even when the last
+    /// block lands inside a throttle window. Human mode prints it only when a
+    /// download printed progress and the line would not repeat the last one.
+    fn finish_download(&mut self, done: u64, total: u64) {
+        if self.download_finished {
+            return;
+        }
+        self.download_finished = true;
+
+        match self.mode {
+            Mode::Json => {
+                let elapsed_ms = self.started.elapsed().as_millis();
+                self.write_line(&format!(
+                    "{{\"event\":\"progress\",\"phase\":\"download\",\"done_bytes\":{done},\"total_bytes\":{total},\"elapsed_ms\":{elapsed_ms},\"final\":true}}"
+                ));
+            }
+            Mode::Human => {
+                let percent = whole_percent(done, total);
+                if self.last_emit.is_some() && percent != self.last_percent {
+                    eprintln!(
+                        "  {} / {} ({percent}%)",
+                        format_bytes(done),
+                        format_bytes(total)
+                    );
+                }
+            }
+        }
+    }
+
+    fn emit_phase(&self, name: &str) {
+        if self.mode != Mode::Json {
+            return;
+        }
+        self.write_line(&format!("{{\"event\":\"phase\",\"phase\":\"{name}\"}}"));
+    }
+
+    fn emit_done(&self, path: &str) {
+        if self.mode != Mode::Json {
+            return;
+        }
+        self.write_line(&format!(
+            "{{\"event\":\"done\",\"path\":\"{}\"}}",
+            json_escape(path)
+        ));
+    }
+
+    fn emit_error(&self, message: &str) {
+        if self.mode != Mode::Json {
+            return;
+        }
+        self.write_line(&format!(
+            "{{\"event\":\"error\",\"message\":\"{}\"}}",
+            json_escape(message)
+        ));
+    }
+}
+
+fn whole_percent(done: u64, total: u64) -> i32 {
+    done.saturating_mul(100).checked_div(total).unwrap_or(100) as i32
+}
+
+/// Escapes a string for embedding in a JSON string literal.
+///
+/// Handles what a path or error message can contain: quote, backslash, and
+/// control characters. Everything else passes through as UTF-8, which is
+/// already valid JSON.
+fn json_escape(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 fn main() {
     let cli = Cli::parse();
+    let mode = if cli.json { Mode::Json } else { Mode::Human };
 
     let output_path = cli.output.unwrap_or_else(|| {
         PathBuf::from(
@@ -63,15 +251,29 @@ fn main() {
         )
     });
 
+    let reporter = Arc::new(Mutex::new(Reporter::new(mode)));
+
     let mut assembly = match ZsyncAssembly::from_url(&cli.url, &output_path) {
         Ok(a) => a,
         Err(e) => {
-            eprintln!("Error initializing: {e}");
+            let msg = format!("Error initializing: {e}");
+            if let Ok(r) = reporter.lock() {
+                r.emit_error(&msg);
+            }
+            eprintln!("{msg}");
             std::process::exit(1);
         }
     };
 
     assembly.set_range_gap_threshold(cli.range_gap * 1024);
+
+    {
+        let (_, total_bytes) = assembly.progress();
+        let (_, total_blocks) = assembly.block_stats();
+        if let Ok(r) = reporter.lock() {
+            r.emit_start(total_bytes, total_blocks, assembly.blocksize());
+        }
+    }
 
     for input_path in &cli.input {
         match assembly.submit_source_file(input_path) {
@@ -116,15 +318,24 @@ fn main() {
 
     if !assembly.is_complete() {
         eprintln!("Downloading missing blocks...");
+
+        let callback_reporter = Arc::clone(&reporter);
+        assembly.set_progress_callback(move |done, total| {
+            if let Ok(mut r) = callback_reporter.lock() {
+                r.progress(done, total);
+            }
+        });
+
         loop {
             match assembly.download_missing_blocks() {
                 Ok(0) => break,
-                Ok(n) => {
-                    let (done, total) = assembly.block_stats();
-                    eprintln!("Downloaded {n} blocks ({}%)", format_pct(done, total));
-                }
+                Ok(_) => {}
                 Err(e) => {
-                    eprintln!("Download error: {e}");
+                    let msg = format!("Download error: {e}");
+                    if let Ok(r) = reporter.lock() {
+                        r.emit_error(&msg);
+                    }
+                    eprintln!("{msg}");
                     // `exit` skips destructors, and dropping removes the temp file.
                     drop(assembly);
                     std::process::exit(1);
@@ -133,11 +344,24 @@ fn main() {
         }
     }
 
+    if let Ok(mut r) = reporter.lock() {
+        let (done, total) = assembly.progress();
+        r.finish_download(done, total);
+        r.emit_phase("verify");
+    }
+
     eprintln!("Verifying checksum...");
     if let Err(e) = assembly.complete() {
-        eprintln!("Error: {e}");
+        let msg = format!("Error: {e}");
+        if let Ok(r) = reporter.lock() {
+            r.emit_error(&msg);
+        }
+        eprintln!("{msg}");
         std::process::exit(1);
     }
 
+    if let Ok(r) = reporter.lock() {
+        r.emit_done(&output_path.display().to_string());
+    }
     eprintln!("Done: {}", output_path.display());
 }

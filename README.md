@@ -43,6 +43,36 @@ zsync https://example.com/v3.0/app.zsync -i app-v2.9.AppImage -i app-v2.8.AppIma
 zsync https://example.com/file.zsync -o output.bin
 ```
 
+### Progress output
+
+The CLI reports progress during the download, throttled to at most one line
+every 100 ms:
+
+```
+Downloading missing blocks...
+  2.00 KB / 19.07 MB (0%)
+  1.71 MB / 19.07 MB (8%)
+  ...
+  19.07 MB / 19.07 MB (100%)
+```
+
+Pass `--json` to put newline-delimited JSON on stdout instead, for a wrapper
+or a UI to consume. Human-readable messages stay on stderr, so stdout carries
+nothing but JSON:
+
+```json
+{"event":"start","total_bytes":20000000,"total_blocks":9766,"blocksize":2048}
+{"event":"progress","phase":"download","done_bytes":1816576,"total_bytes":20000000,"elapsed_ms":105}
+{"event":"progress","phase":"download","done_bytes":20000000,"total_bytes":20000000,"elapsed_ms":1112,"final":true}
+{"event":"phase","phase":"verify"}
+{"event":"done","path":"output.bin"}
+```
+
+Every line is one JSON object with an `event` field. The events are `start`,
+`progress`, `phase`, `done`, and `error`. The last `progress` event always
+carries `"final":true` and the completed byte count, whatever the throttle
+allowed through.
+
 ## Library Usage
 
 zsync-rs is library-first — the CLI is a thin wrapper around the public API:
